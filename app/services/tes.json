@@ -1,0 +1,18 @@
+[
+{
+    "npm": "123456",
+    "brand": "echo",
+    "images": [
+         "https://example.com/image1.jpg",
+         "https://example.com/image2.jpg"  
+    ]
+},
+{
+    "npm": "0909909",
+    "brand": "echo",
+    "images": [
+            "https://example.com/image3.jpg",
+            "https://example.com/image4.jpg"
+    ]
+}
+]
