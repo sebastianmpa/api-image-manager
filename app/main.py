@@ -1,10 +1,13 @@
 
+from dotenv import load_dotenv
+
+# Cargar variables de entorno PRIMERO
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api import image
 from app.api import candidates
-
-
 
 app = FastAPI()
 
