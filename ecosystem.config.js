@@ -1,9 +1,9 @@
 module.exports = {
   apps: [
     {
-      name: "image-manager",
+      name: "PRONTO-API-IMAGE-MANAGER",
       script: "uvicorn",
-      args: "app.main:app --reload --host 0.0.0.0 --port 8100",
+      args: "app.main:app --reload --host 0.0.0.0 --port 3600",
       interpreter: "C:\\Users\\sebastian\\Desktop\\optimized_image\\.venv\\Scripts\\python",
       watch: true,
       ignore_watch: ["node_modules", "__pycache__", ".venv", "*.log"],
