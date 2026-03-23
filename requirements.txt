@@ -3,3 +3,7 @@ uvicorn
 pillow
 requests
 rembg
+pydantic
+pymongo
+python-dotenv
+boto3
