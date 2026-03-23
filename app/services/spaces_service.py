@@ -37,12 +37,15 @@ def _get_spaces_client():
         endpoint_url=DO_SPACES_ENDPOINT,
         aws_access_key_id=DO_SPACES_KEY,
         aws_secret_access_key=DO_SPACES_SECRET,
-        config=Config(signature_version='s3v4')
+        config=Config(
+            signature_version='s3v4',
+            s3={'addressing_style': 'virtual'}  # IMPORTANTE: Digital Ocean requiere esto
+        )
     )
 
 
 def upload_image_to_spaces(file_bytes, filename, content_type):
-    """Sube una imagen a DigitalOcean Spaces y retorna la URL presignada."""
+    """Sube una imagen a DigitalOcean Spaces y retorna la URL pública directa."""
     DO_SPACES_ENDPOINT = os.getenv("DO_SPACES_ENDPOINT")
     DO_SPACES_BUCKET = os.getenv("DO_SPACES_BUCKET")
     
@@ -55,23 +58,22 @@ def upload_image_to_spaces(file_bytes, filename, content_type):
     client = _get_spaces_client()
     
     try:
-        # Subir el archivo
+        # Subir el archivo con ACL público
         client.put_object(
             Bucket=DO_SPACES_BUCKET, 
             Key=safe_filename, 
             Body=file_bytes, 
-            ContentType=content_type
+            ContentType=content_type,
+            ACL='public-read'
         )
         
-        # Generar URL presignada válida por 7 días (604800 segundos)
-        url = client.generate_presigned_url(
-            'get_object',
-            Params={'Bucket': DO_SPACES_BUCKET, 'Key': safe_filename},
-            ExpiresIn=604800  # 7 días
-        )
+        # URL directa simple con bucket en el hostname
+        # Formato: https://bucket.sfo3.digitaloceanspaces.com/filename
+        url = f"https://{DO_SPACES_BUCKET}.sfo3.digitaloceanspaces.com/{safe_filename}"
         
         print(f"✓ Imagen subida: {safe_filename} (tamaño: {len(file_bytes)} bytes)")
-        print(f"  URL (válida 7 días): {url}")
+        print(f"  URL: {url}")
+        print(f"  Longitud URL: {len(url)} caracteres")
         
         return url
     except Exception as e:
