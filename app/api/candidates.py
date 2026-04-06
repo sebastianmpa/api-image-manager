@@ -197,12 +197,23 @@ async def update_image_endpoint(filename: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error actualizando imagen: {str(e)}")
 
 
-@router.get("/images/list", summary="Listar todas las imágenes")
-async def list_images_endpoint(prefix: str = Query("", description="Prefijo para filtrar imágenes")):
-    """Lista todas las imágenes en DigitalOcean Spaces."""
+@router.get("/images/list", summary="Listar imágenes con paginación")
+async def list_images_endpoint(
+    prefix: str = Query("", description="Prefijo para filtrar imágenes"),
+    page: int = Query(1, ge=1, description="Número de página (comenzando en 1)"),
+    limit: int = Query(25, ge=1, le=100, description="Cantidad de imágenes por página (máximo 100)")
+):
+    """
+    Lista las imágenes en DigitalOcean Spaces con paginación.
+    
+    **Parámetros:**
+    - `prefix`: Filtrar por prefijo (ej. 'ECHO_')
+    - `page`: Número de página (por defecto 1)
+    - `limit`: Imágenes por página (por defecto 10, máximo 100)
+    """
     try:
-        images = list_images_from_spaces(prefix)
-        return {"total": len(images), "images": images}
+        result = list_images_from_spaces(prefix, page, limit)
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listando imágenes: {str(e)}")
 

@@ -123,28 +123,75 @@ def update_image_in_spaces(filename, new_file_bytes, content_type):
     return url
 
 
-def list_images_from_spaces(prefix: str = ""):
-    """Lista todas las imágenes en Digital Ocean Spaces con un prefijo opcional."""
+def list_images_from_spaces(prefix: str = "", page: int = 1, limit: int = 25):
+    """
+    Lista las imágenes en Digital Ocean Spaces con paginación.
+    
+    Args:
+        prefix: Prefijo para filtrar imágenes
+        page: Número de página (comenzando en 1)
+        limit: Cantidad de elementos por página
+    
+    Returns:
+        Dict con total, página, imágenes y metadatos de paginación
+    """
     DO_SPACES_BUCKET = os.getenv("DO_SPACES_BUCKET")
     DO_SPACES_ENDPOINT = os.getenv("DO_SPACES_ENDPOINT")
     
     if not all([DO_SPACES_BUCKET, DO_SPACES_ENDPOINT]):
         raise ValueError("Variables de Digital Ocean Spaces no configuradas.")
     
+    if page < 1:
+        page = 1
+    if limit < 1 or limit > 100:
+        limit = 10
+    
     client = _get_spaces_client()
     try:
+        # Obtener todas las imágenes (Digital Ocean retorna hasta 1000 por defecto)
         response = client.list_objects_v2(Bucket=DO_SPACES_BUCKET, Prefix=prefix)
-        if 'Contents' not in response:
-            return []
         
-        images = []
+        if 'Contents' not in response:
+            return {
+                "total": 0,
+                "page": page,
+                "limit": limit,
+                "total_pages": 0,
+                "images": []
+            }
+        
+        # Convertir a lista y ordenar por fecha (más recientes primero)
+        images_list = []
         for obj in response['Contents']:
-            images.append({
+            images_list.append({
                 "filename": obj['Key'],
                 "size": obj['Size'],
                 "last_modified": obj['LastModified'].isoformat(),
-                "url": f"{DO_SPACES_ENDPOINT}/{obj['Key']}"
+                "url": f"https://{DO_SPACES_BUCKET}.sfo3.digitaloceanspaces.com/{obj['Key']}"
             })
-        return images
+        
+        # Ordenar por fecha (más recientes primero)
+        images_list.sort(key=lambda x: x['last_modified'], reverse=True)
+        
+        # Calcular paginación
+        total = len(images_list)
+        total_pages = (total + limit - 1) // limit  # Redondear hacia arriba
+        
+        # Calcular índices
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+        
+        # Obtener página específica
+        paginated_images = images_list[start_idx:end_idx]
+        
+        return {
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_prev": page > 1,
+            "images": paginated_images
+        }
     except Exception as e:
         raise Exception(f"Error listando imágenes: {str(e)}")
