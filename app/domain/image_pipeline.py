@@ -18,8 +18,6 @@ def process_image_pipeline(img: Image.Image) -> Image.Image:
     square_img.paste(img_white_bg, offset)
     # 5. Resize to 2000x2000
     resized_img = square_img.resize((2000, 2000), Image.LANCZOS)
-    # 6. Flip horizontally
-    flipped_img = ImageOps.mirror(resized_img)
-    # 7. Convert to RGB for JPG export
-    final_img = flipped_img.convert('RGB')
+    # 6. Convert to RGB for JPG export
+    final_img = resized_img.convert('RGB')
     return final_img
