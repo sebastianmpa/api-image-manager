@@ -4,6 +4,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, validator
 from bson import ObjectId
 from typing import Optional, List
+from enum import IntEnum
+
+class PageSize(IntEnum):
+    small = 25
+    medium = 50
+    large = 100
 import boto3
 from botocore.client import Config
 from app.services.spaces_service import (
@@ -14,7 +20,7 @@ from app.services.spaces_service import (
     list_images_from_spaces
 )
 from app.services.image_service import optimize_image_from_url
-from app.services.mongo_service import get_candidates_grouped_paginated, collection, soft_delete_candidate, get_deletion_stats, get_deletion_stats_by_email, save_failed_image, get_failed_images, update_failed_image_status, move_candidate_to_processed, get_processed_candidates
+from app.services.mongo_service import get_candidates_grouped_paginated, collection, soft_delete_candidate, get_deletion_stats, get_deletion_stats_by_email, save_failed_image, get_failed_images, update_failed_image_status, move_candidate_to_processed, get_processed_candidates, get_global_stats
 
 router = APIRouter()
 
@@ -108,57 +114,72 @@ async def process_images_batch(request: ImageProcessingRequest):
             mpn = result.mpn
             candidate_id = result.candidateId
             image_urls = result.imageUrls
-            processed_urls = []
-            
+            processed_images = []  # list of {originalImageUrl, imageUrl}
+
             # Procesar cada URL
+            import time
             for img_idx, url in enumerate(image_urls):
+                optimized_image_bytes = None
+                do_url = None
+                filename = None
                 try:
                     print(f"\n[{chunk_id}] Procesando: {brand} / {mpn} / Imagen {img_idx + 1}/{len(image_urls)}")
                     print(f"  URL: {url}")
-                    
+
                     # Optimizar la imagen desde la URL
                     optimized_image_bytes = await optimize_image_from_url(url)
                     print(f"  ✓ Imagen optimizada ({len(optimized_image_bytes)} bytes)")
-                    
+
                     # Generar nombre único para la imagen
-                    # Formato: brand_mpn_index_timestamp.jpg
-                    import time
                     timestamp = int(time.time() * 1000)
-                    # Usar nombre simple sin caracteres especiales
                     filename = f"{brand}_{mpn}_{img_idx}_{timestamp}.jpg"
-                    
+
                     # Subir a Digital Ocean Spaces
                     do_url = upload_image_to_spaces(optimized_image_bytes, filename, "image/jpeg")
-                    processed_urls.append(do_url)
-                    
+                    print(f"  ✓ Subida a Spaces: {do_url}")
+
+                    processed_images.append({
+                        "originalImageUrl": url,
+                        "imageUrl": do_url
+                    })
+
                 except Exception as e:
                     error_msg = f"Error procesando imagen en result[{result_idx}] url[{img_idx}] ({url}): {str(e)}"
                     print(f"  ✗ {error_msg}")
+                    # Si la imagen llegó a subirse antes del fallo, eliminarla de Spaces
+                    if do_url and filename:
+                        try:
+                            delete_image_from_spaces(filename)
+                            print(f"  ✓ Imagen eliminada de Spaces tras fallo: {filename}")
+                        except Exception as del_e:
+                            print(f"  ⚠ Error eliminando imagen de Spaces: {str(del_e)}")
                     # Guardar la imagen fallida en la colección
                     save_failed_image(chunk_id, brand, mpn, url, str(e))
-                    # Continuar con la siguiente imagen en lugar de fallar todo el lote
+                    # Continuar con la siguiente imagen
                     continue
-            
+                finally:
+                    # Liberar memoria siempre, independientemente del resultado
+                    optimized_image_bytes = None
+
             # Si se procesó al menos una imagen exitosamente, trasladar el candidato
-            if processed_urls:
+            if processed_images:
                 try:
-                    # Trasladar el candidato a processed_candidates
                     processed_data = {
                         "brand": brand,
                         "mpn": mpn,
-                        "processedImageUrls": processed_urls,
-                        "totalImagesProcessed": len(processed_urls),
+                        "processedImageUrls": [img["imageUrl"] for img in processed_images],
+                        "totalImagesProcessed": len(processed_images),
                         "chunkId": chunk_id
                     }
                     move_candidate_to_processed(brand, mpn, processed_data)
                     print(f"  ✓ Candidato trasladado a processed_candidates")
                 except Exception as e:
                     print(f"  ⚠ Error trasladando candidato: {str(e)}")
-            
+
             processed_results.append({
                 "brand": brand,
                 "mpn": mpn,
-                "imageUrls": processed_urls
+                "imageUrls": processed_images
             })
         
         print(f"\n✓ Lote {chunk_id} completado exitosamente\n")
@@ -247,22 +268,41 @@ async def list_images_endpoint(
 
 # ==================== ENDPOINTS DE CANDIDATOS ====================
 
+@router.get("/stats", summary="Totales globales de candidatos")
+def global_stats():
+    """
+    Devuelve los totales globales de candidatos derivados de la tabla original:
+
+    - **pending**: candidatos aún sin procesar (tabla `image_candidates`)
+    - **processed**: candidatos ya procesados (`processed_candidates`)
+    - **deleted**: candidatos eliminados con borrado lógico (`deleted_candidates`)
+    - **failedImages**: total de registros de imágenes fallidas (`failed_images`)
+    - **failedCandidates**: candidatos únicos con al menos una imagen fallida
+    - **total**: pending + processed + deleted
+    """
+    try:
+        return get_global_stats()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/deletion-stats", summary="Listar estadísticas de eliminaciones")
 def list_deletion_stats(
     page: int = Query(1, ge=1, description="Número de página"),
-    limit: int = Query(20, ge=1, le=100, description="Límite de resultados por página")
+    limit: int = Query(20, ge=1, le=100, description="Límite de resultados por página"),
+    date_from: Optional[str] = Query(None, description="Fecha inicio (ISO 8601, ej. 2026-04-01 o 2026-04-01T00:00:00)"),
+    date_to: Optional[str] = Query(None, description="Fecha fin (ISO 8601, ej. 2026-04-30 o 2026-04-30T23:59:59)")
 ):
     """
     Lista las estadísticas de eliminaciones de todos los usuarios.
-    
-    **Retorna:**
-    - email: Email del usuario
-    - deletedCount: Cantidad de candidatos eliminados
-    - lastDeletion: Fecha de última eliminación
-    - totalDeleted: Total de candidatos eliminados
+
+    **Filtros opcionales:**
+    - `date_from` / `date_to`: Rango de fechas sobre `lastDeletion`
     """
     try:
-        return get_deletion_stats(page=page, limit=limit)
+        result = get_deletion_stats(page=page, limit=limit, date_from=date_from, date_to=date_to)
+        result["globalStats"] = get_global_stats()
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -291,27 +331,21 @@ def get_user_deletion_stats(email: str):
 def list_failed_images(
     page: int = Query(1, ge=1, description="Número de página"),
     limit: int = Query(20, ge=1, le=100, description="Límite de resultados por página"),
-    status: Optional[str] = Query(None, description="Filtrar por estado (pending, retry, ignored)")
+    status: Optional[str] = Query(None, description="Filtrar por estado (pending, retry, ignored)"),
+    date_from: Optional[str] = Query(None, description="Fecha inicio (ISO 8601, ej. 2026-04-01 o 2026-04-01T00:00:00)"),
+    date_to: Optional[str] = Query(None, description="Fecha fin (ISO 8601, ej. 2026-04-30 o 2026-04-30T23:59:59)")
 ):
     """
     Lista las imágenes que fallaron durante el procesamiento.
-    
-    **Parámetros:**
-    - `page`: Número de página
-    - `limit`: Cantidad de registros por página
-    - `status`: Filtrar por estado: pending (sin procesar), retry (reintentar), ignored (ignorada)
-    
-    **Retorna:**
-    - chunkId: ID del lote
-    - brand: Marca del producto
-    - mpn: Código MPN
-    - url: URL que falló
-    - error: Descripción del error
-    - failedAt: Fecha del error
-    - status: Estado actual (pending, retry, ignored)
+
+    **Filtros opcionales:**
+    - `status`: pending, retry, ignored
+    - `date_from` / `date_to`: Rango de fechas sobre `failedAt`
     """
     try:
-        return get_failed_images(page=page, limit=limit, status_filter=status)
+        result = get_failed_images(page=page, limit=limit, status_filter=status, date_from=date_from, date_to=date_to)
+        result["globalStats"] = get_global_stats()
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -351,25 +385,21 @@ def list_processed_candidates(
     page: int = Query(1, ge=1, description="Número de página"),
     limit: int = Query(20, ge=1, le=100, description="Límite de resultados por página"),
     brand: Optional[str] = Query(None, description="Filtrar por marca"),
-    mpn: Optional[str] = Query(None, description="Filtrar por MPN")
+    mpn: Optional[str] = Query(None, description="Filtrar por MPN"),
+    date_from: Optional[str] = Query(None, description="Fecha inicio (ISO 8601, ej. 2026-04-01 o 2026-04-01T00:00:00)"),
+    date_to: Optional[str] = Query(None, description="Fecha fin (ISO 8601, ej. 2026-04-30 o 2026-04-30T23:59:59)")
 ):
     """
     Lista los candidatos que ya fueron procesados.
-    Se trasladan automáticamente a esta tabla después de procesar sus imágenes.
-    
-    **Parámetros:**
-    - `page`: Número de página
-    - `limit`: Cantidad de candidatos por página
-    - `brand`: Filtrar por marca (opcional)
-    - `mpn`: Filtrar por MPN (opcional)
-    
-    **Retorna:**
-    - Candidatos procesados con sus URLs de imágenes
-    - Fecha de procesamiento
-    - Datos del procesamiento (cantidad de imágenes, URLs, etc.)
+
+    **Filtros opcionales:**
+    - `brand`, `mpn`: Filtrar por marca o MPN
+    - `date_from` / `date_to`: Rango de fechas sobre `processedAt`
     """
     try:
-        return get_processed_candidates(page=page, limit=limit, brand=brand, mpn=mpn)
+        result = get_processed_candidates(page=page, limit=limit, brand=brand, mpn=mpn, date_from=date_from, date_to=date_to)
+        result["globalStats"] = get_global_stats()
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -411,15 +441,19 @@ def delete_candidate(candidate_id: str, email: str = Query(..., description="Ema
 
 @router.get("/all", summary="Listar candidatos agrupados por brand y mpn")
 def list_candidates(
-    page: int = Query(1, ge=1),
-    limit: int = Query(20, ge=1, le=100),
+    page: int = Query(1, ge=1, description="Número de página"),
+    limit: PageSize = Query(PageSize.small, description="Resultados por página: 25, 50 o 100"),
     brand: Optional[str] = None,
     mpn: Optional[str] = None
 ):
     """
     Devuelve candidatos agrupados por brand y mpn, con paginación.
+
+    **Valores permitidos para `limit`:** 25, 50, 100
     """
     try:
-        return get_candidates_grouped_paginated(page=page, limit=limit, brand=brand, mpn=mpn)
+        result = get_candidates_grouped_paginated(page=page, limit=int(limit), brand=brand, mpn=mpn)
+        result["globalStats"] = get_global_stats()
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

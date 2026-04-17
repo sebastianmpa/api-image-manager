@@ -78,15 +78,23 @@ def soft_delete_candidate(candidate_id: str, email: str):
         return None, str(e)
 
 
-def get_deletion_stats(page: int = 1, limit: int = 20):
+def get_deletion_stats(page: int = 1, limit: int = 20, date_from: str = None, date_to: str = None):
     """
     Obtiene las estadísticas de eliminaciones con paginación.
     Retorna: email, cantidad de candidatos eliminados, fecha última eliminación
     """
     from datetime import datetime
-    
+
+    filters = {}
+    if date_from or date_to:
+        filters["lastDeletion"] = {}
+        if date_from:
+            filters["lastDeletion"]["$gte"] = datetime.fromisoformat(date_from)
+        if date_to:
+            filters["lastDeletion"]["$lte"] = datetime.fromisoformat(date_to)
+
     skip = (page - 1) * limit
-    cursor = deletion_stats_collection.find().sort("lastDeletion", -1).skip(skip).limit(limit)
+    cursor = deletion_stats_collection.find(filters).sort("lastDeletion", -1).skip(skip).limit(limit)
     
     results = []
     for doc in cursor:
@@ -98,9 +106,9 @@ def get_deletion_stats(page: int = 1, limit: int = 20):
             "totalDeleted": doc.get("totalCandidates", 0)
         })
     
-    total_count = deletion_stats_collection.count_documents({})
+    total_count = deletion_stats_collection.count_documents(filters)
     total_pages = (total_count + limit - 1) // limit
-    
+
     return {
         "results": results,
         "stats": {
@@ -171,16 +179,22 @@ def save_failed_image(chunk_id: str, brand: str, mpn: str, url: str, error: str)
     return str(result.inserted_id)
 
 
-def get_failed_images(page: int = 1, limit: int = 20, status_filter: str = None):
+def get_failed_images(page: int = 1, limit: int = 20, status_filter: str = None, date_from: str = None, date_to: str = None):
     """
     Obtiene las imágenes fallidas con paginación.
     """
     from datetime import datetime
-    
+
     filters = {}
     if status_filter:
         filters["status"] = status_filter
-    
+    if date_from or date_to:
+        filters["failedAt"] = {}
+        if date_from:
+            filters["failedAt"]["$gte"] = datetime.fromisoformat(date_from)
+        if date_to:
+            filters["failedAt"]["$lte"] = datetime.fromisoformat(date_to)
+
     skip = (page - 1) * limit
     cursor = failed_images_collection.find(filters).sort("failedAt", -1).skip(skip).limit(limit)
     
@@ -262,18 +276,24 @@ def move_candidate_to_processed(brand: str, mpn: str, processed_data: dict):
         return None, str(e)
 
 
-def get_processed_candidates(page: int = 1, limit: int = 20, brand: str = None, mpn: str = None):
+def get_processed_candidates(page: int = 1, limit: int = 20, brand: str = None, mpn: str = None, date_from: str = None, date_to: str = None):
     """
     Obtiene los candidatos procesados con paginación.
     """
     from datetime import datetime
-    
+
     filters = {}
     if brand:
         filters["brand"] = brand
     if mpn:
         filters["mpn"] = mpn
-    
+    if date_from or date_to:
+        filters["processedAt"] = {}
+        if date_from:
+            filters["processedAt"]["$gte"] = datetime.fromisoformat(date_from)
+        if date_to:
+            filters["processedAt"]["$lte"] = datetime.fromisoformat(date_to)
+
     skip = (page - 1) * limit
     cursor = processed_candidates_collection.find(filters).sort("processedAt", -1).skip(skip).limit(limit)
     
@@ -362,4 +382,31 @@ def get_candidates_grouped_paginated(page: int = 1, limit: int = 20, brand: str 
             "limit": limit,
             "total_pages": total_pages
         }
+    }
+
+
+def get_global_stats():
+    """
+    Devuelve totales globales basados en los candidatos originales:
+    - pending:            candidatos aún en la tabla original (por procesar)
+    - processed:          candidatos trasladados a processed_candidates
+    - deleted:            candidatos eliminados (borrado lógico)
+    - failedImages:       total de registros en failed_images
+    - failedCandidates:   candidatos únicos con al menos una imagen fallida
+    - total:              suma de pending + processed + deleted
+    """
+    pending            = collection.count_documents({})
+    processed          = processed_candidates_collection.count_documents({})
+    deleted            = deleted_candidates_collection.count_documents({})
+    failed_images      = failed_images_collection.count_documents({})
+    # Candidatos únicos con al menos una imagen fallida (por brand+mpn)
+    failed_candidates  = len(failed_images_collection.distinct("mpn"))
+
+    return {
+        "pending":          pending,
+        "processed":        processed,
+        "deleted":          deleted,
+        "failedImages":     failed_images,
+        "failedCandidates": failed_candidates,
+        "total":            pending + processed + deleted,
     }
