@@ -200,6 +200,90 @@ async def process_images_batch(request: ImageProcessingRequest):
         )
 
 
+@router.post("/process-mark-as-processed", summary="Marcar lote como procesado (SIN optimizar)", response_model=ImageProcessingResponse)
+async def process_mark_as_processed(request: ImageProcessingRequest):
+    """
+    Marca un lote de candidatos como procesados SIN optimizar ni subir imágenes.
+    
+    Solo:
+    1. Valida la estructura del JSON de entrada
+    2. Traslada cada candidato de 'image_candidates' a 'processed_candidates'
+    3. Devuelve la misma estructura con las URLs originales
+    
+    **IMPORTANTE:**
+    - NO optimiza imágenes
+    - NO sube a Digital Ocean Spaces
+    - Solo realiza el cambio de tabla en MongoDB
+    - Las URLs devueltas son las mismas que se recibieron
+    
+    **Caso de uso:** Procesar lotes masivos sin necesidad de optimización.
+    """
+    try:
+        chunk_id = request.chunkId
+        results = request.data.results
+        processed_results = []
+        
+        print(f"\n[{chunk_id}] Marcando lote como procesado (sin optimización)")
+        
+        # Procesar cada resultado (brand + mpn)
+        for result_idx, result in enumerate(results):
+            brand = result.brand
+            mpn = result.mpn
+            candidate_id = result.candidateId
+            image_urls = result.imageUrls
+            
+            try:
+                print(f"\n[{chunk_id}] Resultado {result_idx + 1}: {brand} / {mpn}")
+                print(f"  URLs: {len(image_urls)} imagen(es)")
+                
+                # Trasladar candidato a processed_candidates (sin optimizar ni subir)
+                processed_data = {
+                    "brand": brand,
+                    "mpn": mpn,
+                    "originalImageUrls": image_urls,
+                    "totalImagesProcessed": len(image_urls),
+                    "chunkId": chunk_id,
+                    "processedMethod": "mark_as_processed"  # Indica que solo fue marcado, no optimizado
+                }
+                
+                move_candidate_to_processed(brand, mpn, processed_data)
+                print(f"  ✓ Candidato trasladado a processed_candidates")
+                
+                # Devolver las mismas URLs originales
+                processed_results.append({
+                    "brand": brand,
+                    "mpn": mpn,
+                    "imageUrls": [
+                        {
+                            "originalImageUrl": url,
+                            "imageUrl": url  # URLs originales (sin cambios)
+                        } for url in image_urls
+                    ]
+                })
+                
+            except Exception as e:
+                error_msg = f"Error procesando candidato {result_idx} ({brand}/{mpn}): {str(e)}"
+                print(f"  ✗ {error_msg}")
+                raise HTTPException(status_code=400, detail=error_msg)
+        
+        print(f"\n✓ Lote {chunk_id} marcado como procesado (sin optimización)\n")
+        
+        return ImageProcessingResponse(
+            chunkId=chunk_id,
+            data={"results": processed_results}
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Error procesando lote: {str(e)}"
+        print(f"✗ {error_msg}")
+        raise HTTPException(
+            status_code=400,
+            detail=error_msg
+        )
+
+
 @router.post("/upload-image", summary="Subir imagen a DigitalOcean Spaces")
 async def upload_image_to_spaces_endpoint(file: UploadFile = File(...)):
     """Sube una imagen a DigitalOcean Spaces y retorna la URL pública."""
