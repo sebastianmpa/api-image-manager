@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api import image
 from app.api import candidates
+from app.api import bigcommerce
 
 app = FastAPI()
 
@@ -22,3 +23,4 @@ app.add_middleware(
 
 app.include_router(image.router, prefix="/image", tags=["image"])
 app.include_router(candidates.router, prefix="/candidates", tags=["candidates"])
+app.include_router(bigcommerce.router)
