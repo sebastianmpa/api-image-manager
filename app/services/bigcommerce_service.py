@@ -170,10 +170,10 @@ def get_store_credentials(store_id: int) -> Dict:
     connection = None
     try:
         connection = mysql.connector.connect(
-            host="10.1.10.21",
-            user="scriptsv",
-            password="Bogota2025*+*+",
-            database="prontoweb",
+            host=os.getenv("MYSQL_HOST"),
+            user=os.getenv("MYSQL_USER"),
+            password=os.getenv("MYSQL_PASSWORD"),
+            database=os.getenv("MYSQL_DATABASE", "prontoweb"),
             connection_timeout=5,
         )
 
