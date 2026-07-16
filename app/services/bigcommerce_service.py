@@ -527,18 +527,26 @@ def process_bigcommerce_image_update(
             # 4. Obtener imágenes actuales
             existing_images = get_product_images(bc_product_id, access_token, store_hash, client_id)
 
-            # 5. Eliminar todas las imágenes existentes (logos/default)
-            logger.info(f"[{task_id}] Eliminando {len(existing_images)} imagen(es) existente(s)...")
+            # 5. Eliminar solo imágenes de logo/default (no las que ya fueron procesadas)
+            logger.info(f"[{task_id}] Revisando {len(existing_images)} imagen(es) existente(s)...")
             for img in existing_images:
                 img_id = img.get("id")
-                if img_id:
+                alt_text = img.get("alt", "").lower()
+                is_thumbnail = img.get("is_thumbnail", False)
+                
+                # Solo eliminar si es logo o default (primera vez)
+                # Si tiene alt="NWM" o es una imagen procesada, no eliminar
+                if img_id and ("logo" in alt_text or "default" in alt_text or is_thumbnail == False):
                     success, msg = delete_product_image(
                         bc_product_id, img_id, access_token, store_hash, client_id
                     )
                     if success:
                         store_result["deleted_images"].append(img_id)
+                        logger.info(f"[{task_id}] ✓ Eliminado logo/default: {img_id}")
                     else:
                         logger.warning(f"[{task_id}] No se pudo eliminar imagen {img_id}: {msg}")
+                else:
+                    logger.info(f"[{task_id}] ⊝ Conservando imagen existente: {img_id} (alt='{alt_text}')")
 
             # 6. Subir la imagen procesada nueva (description = PRODUCTNAME del producto)
             product_name = product.get("PRODUCTNAME", f"{brand} {sku}")
