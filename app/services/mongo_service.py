@@ -385,6 +385,37 @@ def get_candidates_grouped_paginated(page: int = 1, limit: int = 20, brand: str 
     }
 
 
+def add_manual_image_candidate(brand: str, mpn: str, image_url: str):
+    """
+    Crea un nuevo candidato en image_candidates a partir de una imagen subida
+    manualmente (ya optimizada y alojada en Spaces). Los campos de metadata
+    de scraping (storeId, pageUrl, etc.) quedan en None ya que no aplican.
+    """
+    from datetime import datetime
+
+    candidate = {
+        "storeId": None,
+        "productId": None,
+        "brand": brand,
+        "mpn": mpn,
+        "domain": None,
+        "pageUrl": None,
+        "pageTitle": None,
+        "pageSnippet": None,
+        "categoryGuess": None,
+        "imageUrl": image_url,
+        "thumbnailUrl": None,
+        "searchRank": None,
+        "scoreProductPage": None,
+        "createdAt": datetime.utcnow(),
+        "source": "manual_upload"
+    }
+
+    result = collection.insert_one(candidate)
+    candidate["_id"] = result.inserted_id
+    return candidate
+
+
 def get_global_stats():
     """
     Devuelve totales globales basados en los candidatos originales:

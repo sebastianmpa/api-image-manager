@@ -1,5 +1,5 @@
 
-from fastapi import APIRouter, HTTPException, Query, status, File, UploadFile
+from fastapi import APIRouter, HTTPException, Query, status, File, UploadFile, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, validator
 from bson import ObjectId
@@ -19,8 +19,8 @@ from app.services.spaces_service import (
     update_image_in_spaces,
     list_images_from_spaces
 )
-from app.services.image_service import optimize_image_from_url
-from app.services.mongo_service import get_candidates_grouped_paginated, collection, soft_delete_candidate, get_deletion_stats, get_deletion_stats_by_email, save_failed_image, get_failed_images, update_failed_image_status, move_candidate_to_processed, get_processed_candidates, get_global_stats
+from app.services.image_service import optimize_image_from_url, optimize_image_from_bytes
+from app.services.mongo_service import get_candidates_grouped_paginated, collection, soft_delete_candidate, get_deletion_stats, get_deletion_stats_by_email, save_failed_image, get_failed_images, update_failed_image_status, move_candidate_to_processed, get_processed_candidates, get_global_stats, add_manual_image_candidate
 
 router = APIRouter()
 
@@ -294,6 +294,52 @@ async def upload_image_to_spaces_endpoint(file: UploadFile = File(...)):
         return {"filename": filename, "url": url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error subiendo imagen: {str(e)}")
+
+
+@router.post("/upload-product-image", summary="Subir imagen de producto y asociarla a marca+mpn")
+async def upload_product_image_endpoint(
+    brand: str = Form(..., description="Marca del producto"),
+    mpn: str = Form(..., description="Código MPN/SKU del producto"),
+    file: UploadFile = File(...)
+):
+    """
+    Sube una imagen de producto:
+    1. Optimiza la imagen recibida
+    2. La sube a Digital Ocean Spaces
+    3. Crea un nuevo candidato en 'image_candidates' con brand+mpn+imageUrl
+       (los campos de metadata de scraping quedan en None, ya que no aplican)
+
+    El candidato queda visible en GET /candidates/all y sigue el mismo flujo
+    de procesamiento/borrado que cualquier otro candidato.
+    """
+    brand = brand.strip()
+    mpn = mpn.strip()
+    if not brand or not mpn:
+        raise HTTPException(status_code=400, detail="brand y mpn no pueden estar vacíos")
+
+    try:
+        import time
+
+        contents = await file.read()
+        optimized_image_bytes = optimize_image_from_bytes(contents)
+
+        timestamp = int(time.time() * 1000)
+        filename = f"{brand}_{mpn}_{timestamp}.jpg"
+
+        image_url = upload_image_to_spaces(optimized_image_bytes, filename, "image/jpeg")
+
+        candidate = add_manual_image_candidate(brand, mpn, image_url)
+
+        return {
+            "candidateId": str(candidate["_id"]),
+            "brand": brand,
+            "mpn": mpn,
+            "imageUrl": image_url
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error subiendo imagen de producto: {str(e)}")
 
 
 @router.get("/image/{filename}", summary="Obtener imagen de DigitalOcean Spaces")
