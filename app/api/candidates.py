@@ -574,7 +574,8 @@ def list_candidates(
     page: int = Query(1, ge=1, description="Número de página"),
     limit: PageSize = Query(PageSize.small, description="Resultados por página: 25, 50 o 100"),
     brand: Optional[str] = None,
-    mpn: Optional[str] = None
+    mpn: Optional[str] = None,
+    lote: Optional[str] = Query(None, description="Filtrar por número de lote")
 ):
     """
     Devuelve candidatos agrupados por brand y mpn, con paginación.
@@ -582,7 +583,7 @@ def list_candidates(
     **Valores permitidos para `limit`:** 25, 50, 100
     """
     try:
-        result = get_candidates_grouped_paginated(page=page, limit=int(limit), brand=brand, mpn=mpn)
+        result = get_candidates_grouped_paginated(page=page, limit=int(limit), brand=brand, mpn=mpn, lote=lote)
         result["globalStats"] = get_global_stats()
         return result
     except Exception as e:

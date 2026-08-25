@@ -327,12 +327,14 @@ def get_processed_candidates(page: int = 1, limit: int = 20, brand: str = None, 
     }
 
 
-def get_candidates_grouped_paginated(page: int = 1, limit: int = 20, brand: str = None, mpn: str = None):
+def get_candidates_grouped_paginated(page: int = 1, limit: int = 20, brand: str = None, mpn: str = None, lote: str = None):
     filters = {}
     if brand:
         filters["brand"] = brand
     if mpn:
         filters["mpn"] = mpn
+    if lote:
+        filters["lote"] = lote
 
     skip = (page - 1) * limit
     cursor = collection.find(filters).sort("createdAt", -1).skip(skip).limit(limit)
