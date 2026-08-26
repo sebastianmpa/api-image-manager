@@ -22,6 +22,7 @@ deleted_candidates_collection = db["deleted_candidates"]
 deletion_stats_collection = db["deletion_stats"]
 failed_images_collection = db["failed_images"]
 processed_candidates_collection = db["processed_candidates"]
+not_found_candidates_collection = db["image_candidates_not_found"]
 
 
 def soft_delete_candidate(candidate_id: str, email: str):
@@ -387,6 +388,52 @@ def get_candidates_grouped_paginated(page: int = 1, limit: int = 20, brand: str 
     }
 
 
+def get_not_found_candidates_paginated(page: int = 1, limit: int = 20, brand: str = None, mpn: str = None, lote: str = None):
+    """
+    Obtiene los registros de búsquedas sin resultados (image_candidates_not_found)
+    con paginación. No tienen imagen asociada, solo el registro de la búsqueda.
+    """
+    from bson import ObjectId
+    from datetime import datetime
+
+    filters = {}
+    if brand:
+        filters["brand"] = brand
+    if mpn:
+        filters["mpn"] = mpn
+    if lote:
+        filters["lote"] = lote
+
+    skip = (page - 1) * limit
+    cursor = not_found_candidates_collection.find(filters).sort("createdAt", -1).skip(skip).limit(limit)
+
+    def convert_obj(obj):
+        if isinstance(obj, ObjectId):
+            return str(obj)
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, dict):
+            return {k: convert_obj(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [convert_obj(i) for i in obj]
+        return obj
+
+    results = [convert_obj(doc) for doc in cursor]
+
+    total_count = not_found_candidates_collection.count_documents(filters)
+    total_pages = (total_count + limit - 1) // limit
+
+    return {
+        "results": results,
+        "stats": {
+            "total": total_count,
+            "page": page,
+            "limit": limit,
+            "total_pages": total_pages
+        }
+    }
+
+
 def add_manual_image_candidate(brand: str, mpn: str, image_url: str):
     """
     Crea un nuevo candidato en image_candidates a partir de una imagen subida
@@ -416,6 +463,40 @@ def add_manual_image_candidate(brand: str, mpn: str, image_url: str):
     result = collection.insert_one(candidate)
     candidate["_id"] = result.inserted_id
     return candidate
+
+
+def resolve_not_found_candidates(brand: str, mpn: str, image_urls: list):
+    """
+    Cuando se sube manualmente una imagen para brand+mpn, resuelve los registros
+    'not found' pendientes de esa marca+mpn: los traslada a processed_candidates
+    (con las URLs de las imágenes que los resolvieron) y los elimina de
+    image_candidates_not_found.
+
+    Retorna la lista de _id (como string) de los registros movidos.
+    """
+    from datetime import datetime
+
+    matches = list(not_found_candidates_collection.find({"brand": brand, "mpn": mpn}))
+    moved_ids = []
+
+    for doc in matches:
+        original_id = doc["_id"]
+
+        processed_doc = {k: v for k, v in doc.items() if k != "_id"}
+        processed_doc["originalId"] = original_id
+        processed_doc["processedAt"] = datetime.utcnow()
+        processed_doc["processedMethod"] = "manual_upload_resolved_not_found"
+        processed_doc["processedData"] = {
+            "brand": brand,
+            "mpn": mpn,
+            "imageUrls": image_urls
+        }
+
+        processed_candidates_collection.insert_one(processed_doc)
+        not_found_candidates_collection.delete_one({"_id": original_id})
+        moved_ids.append(str(original_id))
+
+    return moved_ids
 
 
 def get_global_stats():

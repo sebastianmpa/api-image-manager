@@ -1,5 +1,5 @@
 
-from fastapi import APIRouter, HTTPException, Query, status, File, UploadFile, Form
+from fastapi import APIRouter, HTTPException, Query, status, File, UploadFile, Form, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, validator
 from bson import ObjectId
@@ -20,7 +20,8 @@ from app.services.spaces_service import (
     list_images_from_spaces
 )
 from app.services.image_service import optimize_image_from_url, optimize_image_from_bytes
-from app.services.mongo_service import get_candidates_grouped_paginated, collection, soft_delete_candidate, get_deletion_stats, get_deletion_stats_by_email, save_failed_image, get_failed_images, update_failed_image_status, move_candidate_to_processed, get_processed_candidates, get_global_stats, add_manual_image_candidate
+from app.services.mongo_service import get_candidates_grouped_paginated, collection, soft_delete_candidate, get_deletion_stats, get_deletion_stats_by_email, save_failed_image, get_failed_images, update_failed_image_status, move_candidate_to_processed, get_processed_candidates, get_global_stats, add_manual_image_candidate, get_not_found_candidates_paginated, resolve_not_found_candidates
+from app.api.bigcommerce import process_bigcommerce_upload
 
 router = APIRouter()
 
@@ -296,50 +297,91 @@ async def upload_image_to_spaces_endpoint(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error subiendo imagen: {str(e)}")
 
 
-@router.post("/upload-product-image", summary="Subir imagen de producto y asociarla a marca+mpn")
+@router.post("/upload-product-image", summary="Subir una o varias imágenes de producto, asociarlas a marca+mpn y enviarlas a BigCommerce")
 async def upload_product_image_endpoint(
+    background_tasks: BackgroundTasks,
     brand: str = Form(..., description="Marca del producto"),
     mpn: str = Form(..., description="Código MPN/SKU del producto"),
-    file: UploadFile = File(...)
+    files: List[UploadFile] = File(..., description="Una o más imágenes a subir")
 ):
     """
-    Sube una imagen de producto:
-    1. Optimiza la imagen recibida
+    Sube una o varias imágenes de producto. Por cada imagen:
+    1. La optimiza
     2. La sube a Digital Ocean Spaces
     3. Crea un nuevo candidato en 'image_candidates' con brand+mpn+imageUrl
        (los campos de metadata de scraping quedan en None, ya que no aplican)
+    4. Encola el envío de esa imagen a BigCommerce (una tarea en background por imagen,
+       ya que ese servicio solo acepta una imagen a la vez)
 
-    El candidato queda visible en GET /candidates/all y sigue el mismo flujo
-    de procesamiento/borrado que cualquier otro candidato.
+    Al terminar el lote, si hay registros en 'image_candidates_not_found' para ese
+    brand+mpn (búsquedas previas sin resultado), se eliminan de ahí y se trasladan a
+    'processed_candidates', ya que ahora sí existe imagen para ese producto.
+
+    Si una imagen falla al optimizarse/subirse a Spaces, continúa con las demás y la
+    reporta en 'failed'. El envío a BigCommerce corre en background y no bloquea la
+    respuesta; su resultado solo queda en logs (mismo comportamiento que
+    POST /bigcommerce/upload-image).
     """
     brand = brand.strip()
     mpn = mpn.strip()
     if not brand or not mpn:
         raise HTTPException(status_code=400, detail="brand y mpn no pueden estar vacíos")
+    if not files:
+        raise HTTPException(status_code=400, detail="Debe enviar al menos un archivo")
 
-    try:
-        import time
+    import time
+    import uuid
 
-        contents = await file.read()
-        optimized_image_bytes = optimize_image_from_bytes(contents)
+    created = []
+    failed = []
 
-        timestamp = int(time.time() * 1000)
-        filename = f"{brand}_{mpn}_{timestamp}.jpg"
+    for idx, file in enumerate(files):
+        try:
+            contents = await file.read()
+            optimized_image_bytes = optimize_image_from_bytes(contents)
 
-        image_url = upload_image_to_spaces(optimized_image_bytes, filename, "image/jpeg")
+            timestamp = int(time.time() * 1000)
+            filename = f"{brand}_{mpn}_{idx}_{timestamp}.jpg"
 
-        candidate = add_manual_image_candidate(brand, mpn, image_url)
+            image_url = upload_image_to_spaces(optimized_image_bytes, filename, "image/jpeg")
 
-        return {
-            "candidateId": str(candidate["_id"]),
-            "brand": brand,
-            "mpn": mpn,
-            "imageUrl": image_url
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error subiendo imagen de producto: {str(e)}")
+            candidate = add_manual_image_candidate(brand, mpn, image_url)
+
+            bc_task_id = f"bc-upload-{timestamp}-{uuid.uuid4().hex[:8]}"
+            background_tasks.add_task(
+                process_bigcommerce_upload,
+                brand=brand,
+                sku=mpn,
+                processed_image_url=image_url,
+                original_image_url=image_url,
+                task_id=bc_task_id
+            )
+
+            created.append({
+                "candidateId": str(candidate["_id"]),
+                "imageUrl": image_url,
+                "originalFilename": file.filename,
+                "bigcommerceTaskId": bc_task_id
+            })
+        except Exception as e:
+            failed.append({
+                "originalFilename": file.filename,
+                "error": str(e)
+            })
+
+    resolved_not_found = []
+    if created:
+        resolved_not_found = resolve_not_found_candidates(brand, mpn, [c["imageUrl"] for c in created])
+
+    return {
+        "brand": brand,
+        "mpn": mpn,
+        "totalUploaded": len(created),
+        "totalFailed": len(failed),
+        "candidates": created,
+        "failed": failed,
+        "resolvedNotFound": resolved_not_found
+    }
 
 
 @router.get("/image/{filename}", summary="Obtener imagen de DigitalOcean Spaces")
@@ -580,10 +622,18 @@ def list_candidates(
     """
     Devuelve candidatos agrupados por brand y mpn, con paginación.
 
+    Además incluye `notFound`: búsquedas que no arrojaron ningún resultado
+    (colección `image_candidates_not_found`), sin imagen asociada.
+
     **Valores permitidos para `limit`:** 25, 50, 100
     """
     try:
         result = get_candidates_grouped_paginated(page=page, limit=int(limit), brand=brand, mpn=mpn, lote=lote)
+
+        not_found = get_not_found_candidates_paginated(page=page, limit=int(limit), brand=brand, mpn=mpn, lote=lote)
+        result["notFound"] = not_found["results"]
+        result["notFoundStats"] = not_found["stats"]
+
         result["globalStats"] = get_global_stats()
         return result
     except Exception as e:
