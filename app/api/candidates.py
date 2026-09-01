@@ -20,7 +20,7 @@ from app.services.spaces_service import (
     list_images_from_spaces
 )
 from app.services.image_service import optimize_image_from_url, optimize_image_from_bytes
-from app.services.mongo_service import get_candidates_grouped_paginated, collection, soft_delete_candidate, get_deletion_stats, get_deletion_stats_by_email, save_failed_image, get_failed_images, update_failed_image_status, move_candidate_to_processed, get_processed_candidates, get_global_stats, add_manual_image_candidate, get_not_found_candidates_paginated, resolve_not_found_candidates
+from app.services.mongo_service import get_candidates_grouped_paginated, collection, soft_delete_candidate, get_deletion_stats, get_deletion_stats_by_email, save_failed_image, get_failed_images, update_failed_image_status, move_candidate_to_processed, get_processed_candidates, get_global_stats, add_manual_processed_candidate, get_not_found_candidates_paginated, resolve_not_found_candidates
 from app.api.bigcommerce import process_bigcommerce_upload
 
 router = APIRouter()
@@ -297,25 +297,32 @@ async def upload_image_to_spaces_endpoint(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error subiendo imagen: {str(e)}")
 
 
-@router.post("/upload-product-image", summary="Subir una o varias imágenes de producto, asociarlas a marca+mpn y enviarlas a BigCommerce")
+@router.post("/upload-product-image", summary="Subir una o varias imágenes de producto ya aprobadas, asociarlas a marca+mpn y enviarlas a BigCommerce")
 async def upload_product_image_endpoint(
     background_tasks: BackgroundTasks,
     brand: str = Form(..., description="Marca del producto"),
     mpn: str = Form(..., description="Código MPN/SKU del producto"),
-    files: List[UploadFile] = File(..., description="Una o más imágenes a subir")
+    email: str = Form(..., description="Email del usuario que sube la(s) imagen(es)"),
+    files: List[UploadFile] = File(..., description="Una o más imágenes a subir"),
+    is_diagram: List[bool] = Form(..., description="Un valor por cada imagen en 'files', emparejado por posición (el N-ésimo is_diagram corresponde al N-ésimo file): True si esa imagen es un diagrama, False si es una foto de producto normal")
 ):
     """
-    Sube una o varias imágenes de producto. Por cada imagen:
+    Sube una o varias imágenes de producto ya aprobadas. Por cada imagen:
     1. La optimiza
     2. La sube a Digital Ocean Spaces
-    3. Crea un nuevo candidato en 'image_candidates' con brand+mpn+imageUrl
-       (los campos de metadata de scraping quedan en None, ya que no aplican)
+    3. Crea un candidato directamente en 'processed_candidates' (queda aprobado de
+       una vez, con brand, mpn, email, lote="000" e isDiagram según corresponda a
+       esa imagen específica)
     4. Encola el envío de esa imagen a BigCommerce (una tarea en background por imagen,
-       ya que ese servicio solo acepta una imagen a la vez)
+       ya que ese servicio solo acepta una imagen a la vez). El custom field __IMG
+       queda en "DGR" o "NWM" según el is_diagram de esa imagen puntual.
+
+    `is_diagram` debe tener exactamente la misma cantidad de valores que `files`,
+    en el mismo orden (posición 0 de is_diagram ↔ posición 0 de files, etc.).
 
     Al terminar el lote, si hay registros en 'image_candidates_not_found' para ese
     brand+mpn (búsquedas previas sin resultado), se eliminan de ahí y se trasladan a
-    'processed_candidates', ya que ahora sí existe imagen para ese producto.
+    'processed_candidates' también, ya que ahora sí existe imagen para ese producto.
 
     Si una imagen falla al optimizarse/subirse a Spaces, continúa con las demás y la
     reporta en 'failed'. El envío a BigCommerce corre en background y no bloquea la
@@ -324,10 +331,18 @@ async def upload_product_image_endpoint(
     """
     brand = brand.strip()
     mpn = mpn.strip()
+    email = email.strip()
     if not brand or not mpn:
         raise HTTPException(status_code=400, detail="brand y mpn no pueden estar vacíos")
+    if not email:
+        raise HTTPException(status_code=400, detail="email no puede estar vacío")
     if not files:
         raise HTTPException(status_code=400, detail="Debe enviar al menos un archivo")
+    if len(is_diagram) != len(files):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Debe enviar un valor de is_diagram por cada archivo: {len(files)} archivo(s) pero {len(is_diagram)} valor(es) de is_diagram"
+        )
 
     import time
     import uuid
@@ -335,7 +350,7 @@ async def upload_product_image_endpoint(
     created = []
     failed = []
 
-    for idx, file in enumerate(files):
+    for idx, (file, diagram_flag) in enumerate(zip(files, is_diagram)):
         try:
             contents = await file.read()
             optimized_image_bytes = optimize_image_from_bytes(contents)
@@ -345,7 +360,7 @@ async def upload_product_image_endpoint(
 
             image_url = upload_image_to_spaces(optimized_image_bytes, filename, "image/jpeg")
 
-            candidate = add_manual_image_candidate(brand, mpn, image_url)
+            candidate = add_manual_processed_candidate(brand, mpn, image_url, email, diagram_flag)
 
             bc_task_id = f"bc-upload-{timestamp}-{uuid.uuid4().hex[:8]}"
             background_tasks.add_task(
@@ -354,13 +369,15 @@ async def upload_product_image_endpoint(
                 sku=mpn,
                 processed_image_url=image_url,
                 original_image_url=image_url,
-                task_id=bc_task_id
+                task_id=bc_task_id,
+                is_diagram=diagram_flag
             )
 
             created.append({
                 "candidateId": str(candidate["_id"]),
                 "imageUrl": image_url,
                 "originalFilename": file.filename,
+                "isDiagram": diagram_flag,
                 "bigcommerceTaskId": bc_task_id
             })
         except Exception as e:
@@ -371,11 +388,16 @@ async def upload_product_image_endpoint(
 
     resolved_not_found = []
     if created:
-        resolved_not_found = resolve_not_found_candidates(brand, mpn, [c["imageUrl"] for c in created])
+        resolved_not_found = resolve_not_found_candidates(
+            brand, mpn,
+            images=[{"imageUrl": c["imageUrl"], "isDiagram": c["isDiagram"]} for c in created],
+            email=email
+        )
 
     return {
         "brand": brand,
         "mpn": mpn,
+        "email": email,
         "totalUploaded": len(created),
         "totalFailed": len(failed),
         "candidates": created,
@@ -446,11 +468,16 @@ def global_stats():
     Devuelve los totales globales de candidatos derivados de la tabla original:
 
     - **pending**: candidatos aún sin procesar (tabla `image_candidates`)
-    - **processed**: candidatos ya procesados (`processed_candidates`)
+    - **processed**: candidatos ya procesados/aprobados (`processed_candidates`)
     - **deleted**: candidatos eliminados con borrado lógico (`deleted_candidates`)
+    - **notFound**: búsquedas sin resultado (`image_candidates_not_found`)
     - **failedImages**: total de registros de imágenes fallidas (`failed_images`)
     - **failedCandidates**: candidatos únicos con al menos una imagen fallida
     - **total**: pending + processed + deleted
+    - **manualUploads**: candidatos aprobados subidos manualmente (no vía scraping)
+    - **images** / **diagrams**: candidatos aprobados que son imagen vs diagrama
+    - **uniqueSkus**: combinaciones brand+mpn distintas entre los aprobados
+    - **secondaryImages**: imágenes aprobadas adicionales sobre la primera por SKU
     """
     try:
         return get_global_stats()
@@ -552,24 +579,28 @@ def update_failed_image_status_endpoint(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/processed", summary="Listar candidatos procesados")
+@router.get("/processed", summary="Listar candidatos procesados (aprobados)")
 def list_processed_candidates(
     page: int = Query(1, ge=1, description="Número de página"),
     limit: int = Query(20, ge=1, le=100, description="Límite de resultados por página"),
     brand: Optional[str] = Query(None, description="Filtrar por marca"),
     mpn: Optional[str] = Query(None, description="Filtrar por MPN"),
+    lote: Optional[str] = Query(None, description="Filtrar por número de lote"),
+    email: Optional[str] = Query(None, description="Filtrar por usuario que aprobó/subió la imagen"),
     date_from: Optional[str] = Query(None, description="Fecha inicio (ISO 8601, ej. 2026-04-01 o 2026-04-01T00:00:00)"),
     date_to: Optional[str] = Query(None, description="Fecha fin (ISO 8601, ej. 2026-04-30 o 2026-04-30T23:59:59)")
 ):
     """
-    Lista los candidatos que ya fueron procesados.
+    Lista los candidatos que ya fueron procesados (aprobados).
 
     **Filtros opcionales:**
     - `brand`, `mpn`: Filtrar por marca o MPN
+    - `lote`: Filtrar por número de lote (las subidas manuales quedan en lote "000")
+    - `email`: Filtrar por usuario que subió/procesó la imagen
     - `date_from` / `date_to`: Rango de fechas sobre `processedAt`
     """
     try:
-        result = get_processed_candidates(page=page, limit=limit, brand=brand, mpn=mpn, date_from=date_from, date_to=date_to)
+        result = get_processed_candidates(page=page, limit=limit, brand=brand, mpn=mpn, lote=lote, email=email, date_from=date_from, date_to=date_to)
         result["globalStats"] = get_global_stats()
         return result
     except Exception as e:

@@ -67,6 +67,15 @@ atexit.register(_close_mongo_client)
 
 # ==================== NORMALIZACIÓN DE MARCA ====================
 
+KNOWN_BRAND_GROUPS = [
+    ["BRIGGS", "BRIGGS & STRATTON", "BRIGGS&STRATTON", "BRIGGS AND STRATTON"],
+    ["ECHO", "ECHO INC"],
+    ["HONDA", "HONDA MOTOR"],
+    ["HUSTLER", "HUSTLER TURF"],
+    ["SCAG", "SCAG POWER EQUIPMENT"],
+]
+
+
 def _normalize_brand(brand: str) -> List[str]:
     """
     Genera variantes en MAYÚSCULAS de la marca para búsqueda flexible.
@@ -74,24 +83,29 @@ def _normalize_brand(brand: str) -> List[str]:
     brand_clean = brand.strip().upper()
     variants = [brand_clean]
 
-    known_mappings = {
-        "BRIGGS": ["BRIGGS & STRATTON", "BRIGGS&STRATTON", "BRIGGS AND STRATTON"],
-        "ECHO": ["ECHO", "ECHO INC"],
-        "HONDA": ["HONDA", "HONDA MOTOR"],
-        "HUSTLER": ["HUSTLER", "HUSTLER TURF"],
-        "SCAG": ["SCAG", "SCAG POWER EQUIPMENT"],
-    }
-    if brand_clean in known_mappings:
-        variants.extend(known_mappings[brand_clean])
+    # Si la marca (en cualquiera de sus formas conocidas) pertenece a un grupo,
+    # agregar todas las variantes del grupo. Antes esto solo funcionaba si
+    # brand_clean coincidía EXACTAMENTE con la forma corta (ej. "BRIGGS"), así que
+    # "BRIGGS AND STRATTON" nunca lo activaba.
+    for group in KNOWN_BRAND_GROUPS:
+        if brand_clean in group:
+            variants.extend(group)
+            break
 
-    # Generar variantes con/sin & para marcas multipalabra
-    if "&" not in brand_clean and len(brand_clean.split()) == 2:
-        w = brand_clean.split()
-        variants += [f"{w[0]} & {w[1]}", f"{w[0]}&{w[1]}", f"{w[0]} AND {w[1]}"]
-    elif "&" in brand_clean:
+    # Generar variantes con/sin & para marcas multipalabra. Antes solo cubría el
+    # caso de exactamente 2 palabras ("BRIGGS AND" en vez de "BRIGGS AND STRATTON",
+    # que tiene 3), dejando sin normalizar cualquier marca con "AND" de más de 2 palabras.
+    if "&" in brand_clean:
         variants.append(brand_clean.replace("&", "").replace("  ", " ").strip())
         variants.append(brand_clean.replace("&", " ").replace("  ", " ").strip())
         variants.append(brand_clean.replace("&", "AND").replace("  ", " ").strip())
+    elif " AND " in brand_clean:
+        variants.append(brand_clean.replace(" AND ", " & "))
+        variants.append(brand_clean.replace(" AND ", "&"))
+        variants.append(brand_clean.replace(" AND ", " "))
+    elif len(brand_clean.split()) == 2:
+        w = brand_clean.split()
+        variants += [f"{w[0]} & {w[1]}", f"{w[0]}&{w[1]}", f"{w[0]} AND {w[1]}"]
 
     # Eliminar duplicados manteniendo orden
     seen = set()
@@ -458,6 +472,7 @@ def process_bigcommerce_image_update(
     sku: str,
     processed_image_url: str,
     task_id: str,
+    is_diagram: bool = False,
 ) -> Dict:
     """
     Orquesta el proceso completo:
@@ -470,8 +485,11 @@ def process_bigcommerce_image_update(
     :param sku: SKU o MPN del producto
     :param processed_image_url: URL pública de la imagen procesada
     :param task_id: ID de tarea (para logging)
+    :param is_diagram: Si es True, el custom field __IMG queda en "DGR" (diagrama)
+                        en vez de "NWM" (imagen normal)
     :return: Resumen de resultados
     """
+    img_field_value = "DGR" if is_diagram else "NWM"
     summary = {
         "task_id": task_id,
         "brand": brand,
@@ -527,26 +545,27 @@ def process_bigcommerce_image_update(
             # 4. Obtener imágenes actuales
             existing_images = get_product_images(bc_product_id, access_token, store_hash, client_id)
 
-            # 5. Eliminar solo imágenes de logo/default (no las que ya fueron procesadas)
-            logger.info(f"[{task_id}] Revisando {len(existing_images)} imagen(es) existente(s)...")
+            # 5. Eliminar TODAS las imágenes existentes del producto (logo del fabricante,
+            # fotos previas, etc.) antes de subir la nueva imagen aprobada.
+            #
+            # Nota: antes se intentaba distinguir "logo/default" de "ya procesada" mirando
+            # img.get("alt"), pero la API v3 de BigCommerce no expone ningún campo "alt" en
+            # las imágenes de producto (solo id, is_thumbnail, description, etc.), así que esa
+            # condición nunca se cumplía y el logo original nunca se borraba. Se simplifica a
+            # borrar todo siempre, ya que cada subida aprobada reemplaza la imagen del producto.
+            logger.info(f"[{task_id}] Eliminando {len(existing_images)} imagen(es) existente(s)...")
             for img in existing_images:
                 img_id = img.get("id")
-                alt_text = img.get("alt", "").lower()
-                is_thumbnail = img.get("is_thumbnail", False)
-                
-                # Solo eliminar si es logo o default (primera vez)
-                # Si tiene alt="NWM" o es una imagen procesada, no eliminar
-                if img_id and ("logo" in alt_text or "default" in alt_text or is_thumbnail == False):
-                    success, msg = delete_product_image(
-                        bc_product_id, img_id, access_token, store_hash, client_id
-                    )
-                    if success:
-                        store_result["deleted_images"].append(img_id)
-                        logger.info(f"[{task_id}] ✓ Eliminado logo/default: {img_id}")
-                    else:
-                        logger.warning(f"[{task_id}] No se pudo eliminar imagen {img_id}: {msg}")
+                if not img_id:
+                    continue
+                success, msg = delete_product_image(
+                    bc_product_id, img_id, access_token, store_hash, client_id
+                )
+                if success:
+                    store_result["deleted_images"].append(img_id)
+                    logger.info(f"[{task_id}] ✓ Eliminada imagen existente: {img_id}")
                 else:
-                    logger.info(f"[{task_id}] ⊝ Conservando imagen existente: {img_id} (alt='{alt_text}')")
+                    logger.warning(f"[{task_id}] No se pudo eliminar imagen {img_id}: {msg}")
 
             # 6. Subir la imagen procesada nueva (description = PRODUCTNAME del producto)
             product_name = product.get("PRODUCTNAME", f"{brand} {sku}")
@@ -566,15 +585,15 @@ def process_bigcommerce_image_update(
                 store_result["uploaded_image_id"] = result
                 logger.info(f"[{task_id}] ✅ Imagen actualizada en store={store_id}, product={bc_product_id}")
 
-                # 7. Upsert custom field __IMG = "NWM"
-                logger.info(f"[{task_id}] Actualizando custom field __IMG...")
+                # 7. Upsert custom field __IMG = "NWM" (imagen) o "DGR" (diagrama)
+                logger.info(f"[{task_id}] Actualizando custom field __IMG={img_field_value}...")
                 cf_ok, cf_action = upsert_custom_field(
-                    bc_product_id, "__IMG", "NWM",
+                    bc_product_id, "__IMG", img_field_value,
                     access_token, store_hash, client_id,
                 )
                 store_result["custom_field_img"] = cf_action if cf_ok else f"error: {cf_action}"
                 if cf_ok:
-                    logger.info(f"[{task_id}] ✅ Custom field __IMG=NWM → {cf_action}")
+                    logger.info(f"[{task_id}] ✅ Custom field __IMG={img_field_value} → {cf_action}")
                 else:
                     logger.error(f"[{task_id}] ✗ Error en custom field __IMG: {cf_action}")
             else:

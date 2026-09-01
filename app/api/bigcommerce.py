@@ -59,7 +59,7 @@ class BigCommerceUploadResponse(BaseModel):
 
 # ==================== FUNCIONES DE BACKGROUND ====================
 
-async def process_bigcommerce_upload(brand: str, sku: str, processed_image_url: str, original_image_url: str, task_id: str):
+async def process_bigcommerce_upload(brand: str, sku: str, processed_image_url: str, original_image_url: str, task_id: str, is_diagram: bool = False):
     """
     Procesa el upload de imagen a BigCommerce en segundo plano.
 
@@ -68,14 +68,16 @@ async def process_bigcommerce_upload(brand: str, sku: str, processed_image_url: 
       2. Obtener credenciales de tienda desde MySQL
       3. Eliminar imágenes actuales del producto (logos/default)
       4. Subir la imagen procesada nueva
+      5. Marcar custom field __IMG = "DGR" si es_diagram, o "NWM" si no
     """
     try:
-        logger.info(f"[{task_id}] Tarea recibida: brand={brand}, sku={sku}")
+        logger.info(f"[{task_id}] Tarea recibida: brand={brand}, sku={sku}, is_diagram={is_diagram}")
         result = process_bigcommerce_image_update(
             brand=brand,
             sku=sku,
             processed_image_url=processed_image_url,
             task_id=task_id,
+            is_diagram=is_diagram,
         )
         logger.info(
             f"[{task_id}] Tarea completada: "

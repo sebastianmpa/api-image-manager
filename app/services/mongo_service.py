@@ -277,9 +277,9 @@ def move_candidate_to_processed(brand: str, mpn: str, processed_data: dict):
         return None, str(e)
 
 
-def get_processed_candidates(page: int = 1, limit: int = 20, brand: str = None, mpn: str = None, date_from: str = None, date_to: str = None):
+def get_processed_candidates(page: int = 1, limit: int = 20, brand: str = None, mpn: str = None, lote: str = None, email: str = None, date_from: str = None, date_to: str = None):
     """
-    Obtiene los candidatos procesados con paginación.
+    Obtiene los candidatos procesados (aprobados) con paginación.
     """
     from datetime import datetime
 
@@ -288,6 +288,10 @@ def get_processed_candidates(page: int = 1, limit: int = 20, brand: str = None, 
         filters["brand"] = brand
     if mpn:
         filters["mpn"] = mpn
+    if lote:
+        filters["lote"] = lote
+    if email:
+        filters["email"] = email
     if date_from or date_to:
         filters["processedAt"] = {}
         if date_from:
@@ -434,15 +438,23 @@ def get_not_found_candidates_paginated(page: int = 1, limit: int = 20, brand: st
     }
 
 
-def add_manual_image_candidate(brand: str, mpn: str, image_url: str):
+MANUAL_UPLOAD_LOTE = "000"
+
+
+def add_manual_processed_candidate(brand: str, mpn: str, image_url: str, email: str, is_diagram: bool = False):
     """
-    Crea un nuevo candidato en image_candidates a partir de una imagen subida
-    manualmente (ya optimizada y alojada en Spaces). Los campos de metadata
-    de scraping (storeId, pageUrl, etc.) quedan en None ya que no aplican.
+    Crea directamente un candidato ya aprobado en processed_candidates a partir de
+    una imagen subida manualmente (ya optimizada y alojada en Spaces). No pasa por
+    image_candidates: la imagen manual no necesita un paso de procesamiento aparte.
+
+    Los campos de metadata de scraping (storeId, pageUrl, etc.) quedan en None ya
+    que no aplican. Las subidas manuales se agrupan bajo lote "000".
     """
     from datetime import datetime
 
-    candidate = {
+    now = datetime.utcnow()
+
+    processed_candidate = {
         "storeId": None,
         "productId": None,
         "brand": brand,
@@ -456,28 +468,42 @@ def add_manual_image_candidate(brand: str, mpn: str, image_url: str):
         "thumbnailUrl": None,
         "searchRank": None,
         "scoreProductPage": None,
-        "createdAt": datetime.utcnow(),
-        "source": "manual_upload"
+        "createdAt": now,
+        "email": email,
+        "lote": MANUAL_UPLOAD_LOTE,
+        "processedAt": now,
+        "processedMethod": "manual_upload",
+        "processedData": {
+            "brand": brand,
+            "mpn": mpn,
+            "imageUrl": image_url
+        },
+        "source": "manual_upload",
+        "isDiagram": is_diagram
     }
 
-    result = collection.insert_one(candidate)
-    candidate["_id"] = result.inserted_id
-    return candidate
+    result = processed_candidates_collection.insert_one(processed_candidate)
+    processed_candidate["_id"] = result.inserted_id
+    return processed_candidate
 
 
-def resolve_not_found_candidates(brand: str, mpn: str, image_urls: list):
+def resolve_not_found_candidates(brand: str, mpn: str, images: list, email: str = None):
     """
-    Cuando se sube manualmente una imagen para brand+mpn, resuelve los registros
-    'not found' pendientes de esa marca+mpn: los traslada a processed_candidates
-    (con las URLs de las imágenes que los resolvieron) y los elimina de
-    image_candidates_not_found.
+    Cuando se sube manualmente una o más imágenes para brand+mpn, resuelve los
+    registros 'not found' pendientes de esa marca+mpn: los traslada a
+    processed_candidates (con el detalle de las imágenes que los resolvieron,
+    cada una con su propio isDiagram) y los elimina de image_candidates_not_found.
 
+    :param images: lista de dicts {"imageUrl": str, "isDiagram": bool}
     Retorna la lista de _id (como string) de los registros movidos.
     """
     from datetime import datetime
 
     matches = list(not_found_candidates_collection.find({"brand": brand, "mpn": mpn}))
     moved_ids = []
+    # Solo se marca isDiagram=True a nivel del registro si TODAS las imágenes
+    # que lo resolvieron son diagramas; si hay al menos una foto real, cuenta como imagen.
+    all_diagrams = bool(images) and all(img.get("isDiagram") for img in images)
 
     for doc in matches:
         original_id = doc["_id"]
@@ -489,8 +515,12 @@ def resolve_not_found_candidates(brand: str, mpn: str, image_urls: list):
         processed_doc["processedData"] = {
             "brand": brand,
             "mpn": mpn,
-            "imageUrls": image_urls
+            "images": images
         }
+        processed_doc["source"] = "manual_upload"
+        processed_doc["isDiagram"] = all_diagrams
+        if email:
+            processed_doc["email"] = email
 
         processed_candidates_collection.insert_one(processed_doc)
         not_found_candidates_collection.delete_one({"_id": original_id})
@@ -503,24 +533,46 @@ def get_global_stats():
     """
     Devuelve totales globales basados en los candidatos originales:
     - pending:            candidatos aún en la tabla original (por procesar)
-    - processed:          candidatos trasladados a processed_candidates
+    - processed:          candidatos trasladados a processed_candidates (aprobados)
     - deleted:            candidatos eliminados (borrado lógico)
+    - notFound:           búsquedas sin resultado (image_candidates_not_found)
     - failedImages:       total de registros en failed_images
     - failedCandidates:   candidatos únicos con al menos una imagen fallida
     - total:              suma de pending + processed + deleted
+    - manualUploads:      candidatos aprobados que se subieron manualmente
+    - images / diagrams:  candidatos aprobados que son imagen vs diagrama
+    - uniqueSkus:         combinaciones brand+mpn distintas entre los aprobados
+    - secondaryImages:    imágenes aprobadas adicionales sobre esa primera por SKU
     """
     pending            = collection.count_documents({})
     processed          = processed_candidates_collection.count_documents({})
     deleted            = deleted_candidates_collection.count_documents({})
+    not_found          = not_found_candidates_collection.count_documents({})
     failed_images      = failed_images_collection.count_documents({})
     # Candidatos únicos con al menos una imagen fallida (por brand+mpn)
     failed_candidates  = len(failed_images_collection.distinct("mpn"))
+
+    manual_uploads = processed_candidates_collection.count_documents({"source": "manual_upload"})
+    diagrams       = processed_candidates_collection.count_documents({"isDiagram": True})
+    images         = processed - diagrams
+
+    sku_groups = list(processed_candidates_collection.aggregate([
+        {"$group": {"_id": {"brand": "$brand", "mpn": "$mpn"}, "count": {"$sum": 1}}}
+    ]))
+    unique_skus = len(sku_groups)
+    secondary_images = sum(max(g["count"] - 1, 0) for g in sku_groups)
 
     return {
         "pending":          pending,
         "processed":        processed,
         "deleted":          deleted,
+        "notFound":         not_found,
         "failedImages":     failed_images,
         "failedCandidates": failed_candidates,
         "total":            pending + processed + deleted,
+        "manualUploads":    manual_uploads,
+        "images":           images,
+        "diagrams":         diagrams,
+        "uniqueSkus":       unique_skus,
+        "secondaryImages":  secondary_images,
     }
