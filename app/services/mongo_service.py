@@ -441,6 +441,48 @@ def get_not_found_candidates_paginated(page: int = 1, limit: int = 20, brand: st
 MANUAL_UPLOAD_LOTE = "000"
 
 
+def _canonical_brand(brand: str) -> str:
+    """
+    Reduce variantes equivalentes de marca (mayúsculas/minúsculas, "AND" vs "&", o formas
+    cortas como "BRIGGS" vs "BRIGGS AND STRATTON") a una sola forma canónica, reusando los
+    mismos grupos de marcas conocidas que bigcommerce_service usa para buscar en BigCommerce.
+    """
+    from app.services.bigcommerce_service import KNOWN_BRAND_GROUPS
+
+    brand_clean = (brand or "").strip().upper()
+    for group in KNOWN_BRAND_GROUPS:
+        if brand_clean in group:
+            return group[0]
+    return brand_clean
+
+
+def _brand_mpn_key(brand: str, mpn: str) -> str:
+    """
+    Clave normalizada para agrupar brand+mpn sin que la capitalización ni las variantes
+    conocidas de una misma marca (ej. "Briggs" / "Briggs and Stratton" / "BRIGGS & STRATTON")
+    infle el conteo de SKUs. No cambia el brand/mpn que se guarda ni se muestra, solo se
+    usa para agrupar.
+    """
+    return f"{_canonical_brand(brand)}|{(mpn or '').strip().upper()}"
+
+
+def _is_first_manual_upload(brand: str, mpn: str, is_diagram: bool) -> bool:
+    """
+    True si todavía no existe ningún candidato manual (source="manual_upload")
+    para esa combinación brand+mpn+isDiagram. Se usa para decidir si una imagen
+    manual es "principal" (la primera) o "secundaria" (cualquier otra después).
+
+    Como las imágenes de un mismo lote se insertan una por una en el mismo loop,
+    la primera del lote ve 0 existentes (principal) y las siguientes ya ven la(s)
+    anterior(es) recién insertada(s) (secundarias), sin necesitar lógica aparte
+    para "dentro del mismo lote" vs "en una subida posterior".
+    """
+    existing = processed_candidates_collection.count_documents({
+        "brandMpnKey": _brand_mpn_key(brand, mpn), "source": "manual_upload", "isDiagram": is_diagram
+    })
+    return existing == 0
+
+
 def add_manual_processed_candidate(brand: str, mpn: str, image_url: str, email: str, is_diagram: bool = False):
     """
     Crea directamente un candidato ya aprobado en processed_candidates a partir de
@@ -453,6 +495,7 @@ def add_manual_processed_candidate(brand: str, mpn: str, image_url: str, email: 
     from datetime import datetime
 
     now = datetime.utcnow()
+    is_primary = _is_first_manual_upload(brand, mpn, is_diagram)
 
     processed_candidate = {
         "storeId": None,
@@ -479,7 +522,9 @@ def add_manual_processed_candidate(brand: str, mpn: str, image_url: str, email: 
             "imageUrl": image_url
         },
         "source": "manual_upload",
-        "isDiagram": is_diagram
+        "isDiagram": is_diagram,
+        "isPrimaryManual": is_primary,
+        "brandMpnKey": _brand_mpn_key(brand, mpn)
     }
 
     result = processed_candidates_collection.insert_one(processed_candidate)
@@ -519,6 +564,8 @@ def resolve_not_found_candidates(brand: str, mpn: str, images: list, email: str 
         }
         processed_doc["source"] = "manual_upload"
         processed_doc["isDiagram"] = all_diagrams
+        processed_doc["isPrimaryManual"] = _is_first_manual_upload(brand, mpn, all_diagrams)
+        processed_doc["brandMpnKey"] = _brand_mpn_key(brand, mpn)
         if email:
             processed_doc["email"] = email
 
@@ -533,16 +580,34 @@ def get_global_stats():
     """
     Devuelve totales globales basados en los candidatos originales:
     - pending:            candidatos aún en la tabla original (por procesar)
-    - processed:          candidatos trasladados a processed_candidates (aprobados)
+    - processed:          candidatos trasladados a processed_candidates (aprobados, bot + manual)
     - deleted:            candidatos eliminados (borrado lógico)
     - notFound:           búsquedas sin resultado (image_candidates_not_found)
     - failedImages:       total de registros en failed_images
     - failedCandidates:   candidatos únicos con al menos una imagen fallida
     - total:              suma de pending + processed + deleted
     - manualUploads:      candidatos aprobados que se subieron manualmente
-    - images / diagrams:  candidatos aprobados que son imagen vs diagrama
-    - uniqueSkus:         combinaciones brand+mpn distintas entre los aprobados
-    - secondaryImages:    imágenes aprobadas adicionales sobre esa primera por SKU
+    - images / diagrams:  candidatos aprobados (bot + manual) que son imagen vs diagrama
+    - uniqueSkus:         combinaciones brand+mpn distintas entre los aprobados (bot + manual)
+    - secondaryImages:    imágenes aprobadas adicionales sobre esa primera por SKU (bot + manual)
+
+    Módulo de estadísticas de búsqueda/carga (candidatos encontrados por el bot):
+    - botFoundCandidates:      total de candidatos que alguna vez localizó el bot
+                               (pending + aprobados-por-bot + rechazados-por-usuario)
+    - userApprovedCandidates:  candidatos del bot que el usuario aprobó (movidos a processed_candidates
+                               por el flujo automático, no por subida manual)
+    - userRejectedCandidates:  candidatos del bot que el usuario rechazó (borrado lógico = deleted)
+    - autoProcessedImages:     mismo valor que userApprovedCandidates (deben coincidir por diseño:
+                               un candidato del bot solo llega a processed_candidates si fue aprobado)
+
+    Desglose de imágenes/diagramas subidos manualmente (principal = la primera que se sube
+    para ese brand+mpn; secundaria = cualquier otra después, sea del mismo lote o de uno posterior):
+    - totalManualImages / manualImagesPrimary / manualImagesSecondary
+    - totalManualDiagrams / manualDiagramsPrimary / manualDiagramsSecondary
+
+    Nota: las estadísticas de aprobación/rechazo del QA posterior sobre imágenes ya procesadas
+    automáticamente (revisión humana tipo "images-update") viven en el backend de task-hub,
+    no en esta base de datos, así que no se incluyen acá.
     """
     pending            = collection.count_documents({})
     processed          = processed_candidates_collection.count_documents({})
@@ -562,6 +627,16 @@ def get_global_stats():
     unique_skus = len(sku_groups)
     secondary_images = sum(max(g["count"] - 1, 0) for g in sku_groups)
 
+    # Candidatos de origen bot (no manual) que llegaron a processed_candidates = aprobados por el usuario
+    user_approved_candidates = processed_candidates_collection.count_documents({"source": {"$ne": "manual_upload"}})
+    user_rejected_candidates = deleted  # deleted_candidates solo contiene candidatos de origen bot
+    bot_found_candidates = pending + user_approved_candidates + user_rejected_candidates
+
+    manual_images_primary     = processed_candidates_collection.count_documents({"source": "manual_upload", "isDiagram": False, "isPrimaryManual": True})
+    manual_images_secondary   = processed_candidates_collection.count_documents({"source": "manual_upload", "isDiagram": False, "isPrimaryManual": False})
+    manual_diagrams_primary   = processed_candidates_collection.count_documents({"source": "manual_upload", "isDiagram": True, "isPrimaryManual": True})
+    manual_diagrams_secondary = processed_candidates_collection.count_documents({"source": "manual_upload", "isDiagram": True, "isPrimaryManual": False})
+
     return {
         "pending":          pending,
         "processed":        processed,
@@ -575,4 +650,16 @@ def get_global_stats():
         "diagrams":         diagrams,
         "uniqueSkus":       unique_skus,
         "secondaryImages":  secondary_images,
+
+        "botFoundCandidates":     bot_found_candidates,
+        "userApprovedCandidates": user_approved_candidates,
+        "userRejectedCandidates": user_rejected_candidates,
+        "autoProcessedImages":    user_approved_candidates,
+
+        "totalManualImages":      manual_images_primary + manual_images_secondary,
+        "manualImagesPrimary":    manual_images_primary,
+        "manualImagesSecondary":  manual_images_secondary,
+        "totalManualDiagrams":        manual_diagrams_primary + manual_diagrams_secondary,
+        "manualDiagramsPrimary":      manual_diagrams_primary,
+        "manualDiagramsSecondary":    manual_diagrams_secondary,
     }

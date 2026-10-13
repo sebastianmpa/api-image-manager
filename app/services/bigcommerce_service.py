@@ -545,27 +545,36 @@ def process_bigcommerce_image_update(
             # 4. Obtener imágenes actuales
             existing_images = get_product_images(bc_product_id, access_token, store_hash, client_id)
 
-            # 5. Eliminar TODAS las imágenes existentes del producto (logo del fabricante,
-            # fotos previas, etc.) antes de subir la nueva imagen aprobada.
-            #
-            # Nota: antes se intentaba distinguir "logo/default" de "ya procesada" mirando
-            # img.get("alt"), pero la API v3 de BigCommerce no expone ningún campo "alt" en
-            # las imágenes de producto (solo id, is_thumbnail, description, etc.), así que esa
-            # condición nunca se cumplía y el logo original nunca se borraba. Se simplifica a
-            # borrar todo siempre, ya que cada subida aprobada reemplaza la imagen del producto.
-            logger.info(f"[{task_id}] Eliminando {len(existing_images)} imagen(es) existente(s)...")
-            for img in existing_images:
-                img_id = img.get("id")
-                if not img_id:
-                    continue
-                success, msg = delete_product_image(
-                    bc_product_id, img_id, access_token, store_hash, client_id
+            # 5. Solo borrar las imágenes existentes si el producto todavía tiene el logo
+            # del proveedor (__IMG == "LOGO"). Si ya tiene una imagen real (NWM) o un
+            # diagrama (DGR), o cualquier otro valor, se conserva y solo se agrega la nueva.
+            existing_custom_fields = _get_custom_fields(bc_product_id, access_token, store_hash, client_id)
+            current_img_value = next(
+                (f.get("value") for f in existing_custom_fields if f.get("name") == "__IMG"), None
+            )
+            is_logo_placeholder = (current_img_value or "").strip().upper() == "LOGO"
+
+            if is_logo_placeholder:
+                logger.info(
+                    f"[{task_id}] __IMG='LOGO' → eliminando {len(existing_images)} imagen(es) existente(s)..."
                 )
-                if success:
-                    store_result["deleted_images"].append(img_id)
-                    logger.info(f"[{task_id}] ✓ Eliminada imagen existente: {img_id}")
-                else:
-                    logger.warning(f"[{task_id}] No se pudo eliminar imagen {img_id}: {msg}")
+                for img in existing_images:
+                    img_id = img.get("id")
+                    if not img_id:
+                        continue
+                    success, msg = delete_product_image(
+                        bc_product_id, img_id, access_token, store_hash, client_id
+                    )
+                    if success:
+                        store_result["deleted_images"].append(img_id)
+                        logger.info(f"[{task_id}] ✓ Eliminada imagen existente: {img_id}")
+                    else:
+                        logger.warning(f"[{task_id}] No se pudo eliminar imagen {img_id}: {msg}")
+            else:
+                logger.info(
+                    f"[{task_id}] __IMG='{current_img_value}' (no es logo) → se conservan las "
+                    f"{len(existing_images)} imagen(es) existente(s), solo se agrega la nueva"
+                )
 
             # 6. Subir la imagen procesada nueva (description = PRODUCTNAME del producto)
             product_name = product.get("PRODUCTNAME", f"{brand} {sku}")

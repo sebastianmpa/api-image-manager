@@ -378,6 +378,7 @@ async def upload_product_image_endpoint(
                 "imageUrl": image_url,
                 "originalFilename": file.filename,
                 "isDiagram": diagram_flag,
+                "isPrimaryManual": candidate.get("isPrimaryManual"),
                 "bigcommerceTaskId": bc_task_id
             })
         except Exception as e:
@@ -468,16 +469,33 @@ def global_stats():
     Devuelve los totales globales de candidatos derivados de la tabla original:
 
     - **pending**: candidatos aún sin procesar (tabla `image_candidates`)
-    - **processed**: candidatos ya procesados/aprobados (`processed_candidates`)
+    - **processed**: candidatos ya procesados/aprobados (`processed_candidates`), bot + manual
     - **deleted**: candidatos eliminados con borrado lógico (`deleted_candidates`)
     - **notFound**: búsquedas sin resultado (`image_candidates_not_found`)
     - **failedImages**: total de registros de imágenes fallidas (`failed_images`)
     - **failedCandidates**: candidatos únicos con al menos una imagen fallida
     - **total**: pending + processed + deleted
     - **manualUploads**: candidatos aprobados subidos manualmente (no vía scraping)
-    - **images** / **diagrams**: candidatos aprobados que son imagen vs diagrama
-    - **uniqueSkus**: combinaciones brand+mpn distintas entre los aprobados
-    - **secondaryImages**: imágenes aprobadas adicionales sobre la primera por SKU
+    - **images** / **diagrams**: candidatos aprobados (bot + manual) que son imagen vs diagrama
+    - **uniqueSkus**: combinaciones brand+mpn distintas entre los aprobados (bot + manual)
+    - **secondaryImages**: imágenes aprobadas adicionales sobre la primera por SKU (bot + manual)
+
+    **Módulo de búsqueda/carga (candidatos de origen bot):**
+    - **botFoundCandidates**: total de candidatos que alguna vez localizó el bot
+      (pending + aprobados-por-bot + rechazados-por-usuario)
+    - **userApprovedCandidates**: candidatos del bot que el usuario aprobó (movidos a
+      `processed_candidates` por el flujo automático, no por subida manual)
+    - **userRejectedCandidates**: candidatos del bot que el usuario rechazó (= `deleted`)
+    - **autoProcessedImages**: debe coincidir siempre con `userApprovedCandidates`
+
+    **Desglose de subidas manuales** (principal = la primera imagen/diagrama que se sube
+    para ese brand+mpn; secundaria = cualquier otra después, del mismo lote o de uno posterior):
+    - **totalManualImages** / **manualImagesPrimary** / **manualImagesSecondary**
+    - **totalManualDiagrams** / **manualDiagramsPrimary** / **manualDiagramsSecondary**
+
+    **Nota:** las estadísticas de aprobación/rechazo de la revisión humana posterior sobre
+    imágenes ya procesadas automáticamente (tipo "images-update") viven en el backend de
+    task-hub, no acá, y no están incluidas en esta respuesta.
     """
     try:
         return get_global_stats()
