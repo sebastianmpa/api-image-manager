@@ -21,6 +21,7 @@ from app.services.spaces_service import (
 )
 from app.services.image_service import optimize_image_from_url, optimize_image_from_bytes
 from app.services.mongo_service import get_candidates_grouped_paginated, collection, soft_delete_candidate, get_deletion_stats, get_deletion_stats_by_email, save_failed_image, get_failed_images, update_failed_image_status, move_candidate_to_processed, get_processed_candidates, get_global_stats, add_manual_processed_candidate, get_not_found_candidates_paginated, resolve_not_found_candidates
+from app.services.mysql_stats_service import save_stats_snapshot
 from app.api.bigcommerce import process_bigcommerce_upload
 
 router = APIRouter()
@@ -79,10 +80,18 @@ class ImageProcessingResponse(BaseModel):
     chunkId: str
     data: dict
 
+def _single_product(results: List[ImageResult]) -> dict:
+    """brand/mpn para el snapshot de estadísticas solo si el lote trae un único producto."""
+    products = {(r.brand, r.mpn) for r in results}
+    if len(products) == 1:
+        brand, mpn = products.pop()
+        return {"brand": brand, "mpn": mpn}
+    return {}
+
 # ==================== ENDPOINTS DE PROCESAMIENTO ====================
 
 @router.post("/process-images", summary="Procesar y subir lote de imágenes", response_model=ImageProcessingResponse)
-async def process_images_batch(request: ImageProcessingRequest):
+async def process_images_batch(request: ImageProcessingRequest, background_tasks: BackgroundTasks):
     """
     Procesa un lote de imágenes:
     1. Valida la estructura del JSON de entrada
@@ -184,7 +193,9 @@ async def process_images_batch(request: ImageProcessingRequest):
             })
         
         print(f"\n✓ Lote {chunk_id} completado exitosamente\n")
-        
+
+        background_tasks.add_task(save_stats_snapshot, "process_images", chunk_id=chunk_id, **_single_product(results))
+
         return ImageProcessingResponse(
             chunkId=chunk_id,
             data={"results": processed_results}
@@ -202,7 +213,7 @@ async def process_images_batch(request: ImageProcessingRequest):
 
 
 @router.post("/process-mark-as-processed", summary="Marcar lote como procesado (SIN optimizar)", response_model=ImageProcessingResponse)
-async def process_mark_as_processed(request: ImageProcessingRequest):
+async def process_mark_as_processed(request: ImageProcessingRequest, background_tasks: BackgroundTasks):
     """
     Marca un lote de candidatos como procesados SIN optimizar ni subir imágenes.
     
@@ -268,7 +279,9 @@ async def process_mark_as_processed(request: ImageProcessingRequest):
                 raise HTTPException(status_code=400, detail=error_msg)
         
         print(f"\n✓ Lote {chunk_id} marcado como procesado (sin optimización)\n")
-        
+
+        background_tasks.add_task(save_stats_snapshot, "mark_as_processed", chunk_id=chunk_id, **_single_product(results))
+
         return ImageProcessingResponse(
             chunkId=chunk_id,
             data={"results": processed_results}
@@ -394,6 +407,7 @@ async def upload_product_image_endpoint(
             images=[{"imageUrl": c["imageUrl"], "isDiagram": c["isDiagram"]} for c in created],
             email=email
         )
+        background_tasks.add_task(save_stats_snapshot, "manual_upload", email=email, brand=brand, mpn=mpn)
 
     return {
         "brand": brand,
@@ -503,6 +517,22 @@ def global_stats():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/stats/sync", summary="Guardar snapshot de estadísticas en MySQL")
+def sync_global_stats():
+    """
+    Calcula las estadísticas globales y las inserta como una fila nueva en la tabla
+    MySQL `image_manager_stats` (espejo de `GET /stats`).
+
+    Los snapshots se guardan solos cada vez que se procesa, aprueba, sube o elimina un
+    candidato; este endpoint sirve para forzar uno (ej. desde un cron), ya que los
+    candidatos que el bot inserta directo en MongoDB no pasan por esta API.
+    """
+    stats = save_stats_snapshot("manual_sync")
+    if stats is None:
+        raise HTTPException(status_code=500, detail="No se pudo guardar el snapshot en MySQL (ver logs)")
+    return stats
+
+
 @router.get("/deletion-stats", summary="Listar estadísticas de eliminaciones")
 def list_deletion_stats(
     page: int = Query(1, ge=1, description="Número de página"),
@@ -570,6 +600,7 @@ def list_failed_images(
 @router.put("/failed-images/{failed_image_id}/status", summary="Actualizar estado de imagen fallida")
 def update_failed_image_status_endpoint(
     failed_image_id: str,
+    background_tasks: BackgroundTasks,
     new_status: str = Query(..., description="Nuevo estado: pending, retry, ignored")
 ):
     """
@@ -589,7 +620,8 @@ def update_failed_image_status_endpoint(
         updated = update_failed_image_status(failed_image_id, new_status)
         if not updated:
             raise HTTPException(status_code=404, detail="Imagen fallida no encontrada")
-        
+
+        background_tasks.add_task(save_stats_snapshot, "failed_image_status")
         return {"message": f"Estado actualizado a: {new_status}", "failedImageId": failed_image_id}
     except HTTPException:
         raise
@@ -628,7 +660,7 @@ def list_processed_candidates(
 # ==================== ENDPOINTS DE CANDIDATOS ====================
 
 @router.delete("/{candidate_id}", summary="Eliminar candidato por ID (borrado lógico)", status_code=status.HTTP_200_OK)
-def delete_candidate(candidate_id: str, email: str = Query(..., description="Email del usuario que elimina")):
+def delete_candidate(candidate_id: str, background_tasks: BackgroundTasks, email: str = Query(..., description="Email del usuario que elimina")):
     """
     Realiza un borrado lógico de un candidato:
     1. Obtiene el candidato de la colección original
@@ -647,7 +679,11 @@ def delete_candidate(candidate_id: str, email: str = Query(..., description="Ema
             if error == "Candidato no encontrado":
                 raise HTTPException(status_code=404, detail=error)
             raise HTTPException(status_code=500, detail=error)
-        
+
+        background_tasks.add_task(
+            save_stats_snapshot, "delete_candidate",
+            email=email, brand=candidate.get("brand"), mpn=candidate.get("mpn")
+        )
         return {
             "message": "Candidato eliminado correctamente",
             "candidateId": candidate_id,
