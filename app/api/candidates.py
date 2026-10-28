@@ -125,6 +125,7 @@ async def process_images_batch(request: ImageProcessingRequest, background_tasks
             candidate_id = result.candidateId
             image_urls = result.imageUrls
             processed_images = []  # list of {originalImageUrl, imageUrl}
+            moved_ids = []
 
             # Procesar cada URL
             import time
@@ -181,15 +182,21 @@ async def process_images_batch(request: ImageProcessingRequest, background_tasks
                         "totalImagesProcessed": len(processed_images),
                         "chunkId": chunk_id
                     }
-                    move_candidate_to_processed(brand, mpn, processed_data)
-                    print(f"  ✓ Candidato trasladado a processed_candidates")
+                    moved_ids = move_candidate_to_processed(
+                        brand, mpn, [img["originalImageUrl"] for img in processed_images], processed_data, candidate_id
+                    )
+                    if moved_ids:
+                        print(f"  ✓ {len(moved_ids)} candidato(s) trasladado(s) a processed_candidates: {moved_ids}")
+                    else:
+                        print(f"  ⚠ No se encontró en image_candidates ningún candidato con esas URLs")
                 except Exception as e:
                     print(f"  ⚠ Error trasladando candidato: {str(e)}")
 
             processed_results.append({
                 "brand": brand,
                 "mpn": mpn,
-                "imageUrls": processed_images
+                "imageUrls": processed_images,
+                "movedCandidateIds": moved_ids
             })
         
         print(f"\n✓ Lote {chunk_id} completado exitosamente\n")
@@ -258,9 +265,12 @@ async def process_mark_as_processed(request: ImageProcessingRequest, background_
                     "processedMethod": "mark_as_processed"  # Indica que solo fue marcado, no optimizado
                 }
                 
-                move_candidate_to_processed(brand, mpn, processed_data)
-                print(f"  ✓ Candidato trasladado a processed_candidates")
-                
+                moved_ids = move_candidate_to_processed(brand, mpn, image_urls, processed_data, candidate_id)
+                if moved_ids:
+                    print(f"  ✓ {len(moved_ids)} candidato(s) trasladado(s) a processed_candidates: {moved_ids}")
+                else:
+                    print(f"  ⚠ No se encontró en image_candidates ningún candidato con esas URLs")
+
                 # Devolver las mismas URLs originales
                 processed_results.append({
                     "brand": brand,
@@ -270,7 +280,8 @@ async def process_mark_as_processed(request: ImageProcessingRequest, background_
                             "originalImageUrl": url,
                             "imageUrl": url  # URLs originales (sin cambios)
                         } for url in image_urls
-                    ]
+                    ],
+                    "movedCandidateIds": moved_ids
                 })
                 
             except Exception as e:

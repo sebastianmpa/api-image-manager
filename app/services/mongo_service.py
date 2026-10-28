@@ -243,38 +243,41 @@ def update_failed_image_status(failed_image_id: str, new_status: str):
     return result.modified_count > 0
 
 
-def move_candidate_to_processed(brand: str, mpn: str, processed_data: dict):
+def move_candidate_to_processed(brand: str, mpn: str, image_urls: list, processed_data: dict, candidate_id: str = None):
     """
-    Traslada un candidato de image_candidates a processed_candidates
-    buscando por brand y mpn.
-    Guarda los datos de procesamiento adicionales.
+    Traslada a processed_candidates los candidatos de image_candidates que corresponden
+    a las imágenes seleccionadas: los de ese brand+mpn cuyo imageUrl esté en image_urls
+    (incluye duplicados de la misma URL en otros lotes) y, si viene, el candidate_id.
+
+    Los demás candidatos del mismo brand+mpn (imágenes no seleccionadas) se quedan en
+    image_candidates para que se aprueben o rechacen por separado.
+
+    Retorna la lista de _id (como string) de los candidatos trasladados.
     """
+    from bson import ObjectId
     from datetime import datetime
-    
-    try:
-        # Buscar el candidato por brand y mpn
-        candidate = collection.find_one({"brand": brand, "mpn": mpn})
-        if not candidate:
-            return None, "Candidato no encontrado"
-        
-        candidate_id = candidate["_id"]
-        
-        # Crear documento para tabla de procesados
+
+    conditions = [{"brand": brand, "mpn": mpn, "imageUrl": {"$in": image_urls}}]
+    if candidate_id and ObjectId.is_valid(candidate_id):
+        conditions.append({"_id": ObjectId(candidate_id)})
+
+    candidates = list(collection.find({"$or": conditions}))
+    if not candidates:
+        return []
+
+    now = datetime.utcnow()
+    processed = []
+    for candidate in candidates:
         processed_candidate = candidate.copy()
-        processed_candidate["processedAt"] = datetime.utcnow()
+        processed_candidate["processedAt"] = now
         processed_candidate["processedData"] = processed_data
-        processed_candidate["originalId"] = candidate_id
-        
-        # Insertar en tabla de procesados
-        processed_candidates_collection.insert_one(processed_candidate)
-        
-        # Eliminar de tabla original
-        collection.delete_one({"_id": candidate_id})
-        
-        return candidate, None
-        
-    except Exception as e:
-        return None, str(e)
+        processed_candidate["originalId"] = candidate["_id"]
+        processed.append(processed_candidate)
+
+    processed_candidates_collection.insert_many(processed)
+    collection.delete_many({"_id": {"$in": [c["_id"] for c in candidates]}})
+
+    return [str(c["_id"]) for c in candidates]
 
 
 def get_processed_candidates(page: int = 1, limit: int = 20, brand: str = None, mpn: str = None, lote: str = None, email: str = None, date_from: str = None, date_to: str = None):
