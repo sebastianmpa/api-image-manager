@@ -19,6 +19,10 @@ if not BIGCOMMERCE_API_KEY or BIGCOMMERCE_API_KEY == "test-api-key-12345":
     print("⚠️  ADVERTENCIA: BIGCOMMERCE_API_KEY está usando valor por defecto (test)")
     print("    Define BIGCOMMERCE_API_KEY en .env para producción")
 
+# API Key para las fotos que sube el equipo de Warehouse desde el teléfono.
+# Sin valor por defecto: si no está definida, el endpoint responde 503.
+WAREHOUSE_API_KEY = os.getenv("WAREHOUSE_API_KEY", "")
+
 # ==================== CONFIGURACIÓN DE BD ====================
 
 MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")

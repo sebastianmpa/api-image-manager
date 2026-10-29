@@ -1,6 +1,11 @@
 
-from fastapi import APIRouter, HTTPException, Query, status, File, UploadFile, Form, BackgroundTasks
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Query, status, File, UploadFile, Form, BackgroundTasks, Header
+from fastapi.responses import StreamingResponse, JSONResponse
+from io import BytesIO
+from PIL import Image, ImageOps
+import secrets
+import time
+import uuid
 from pydantic import BaseModel, Field, validator
 from bson import ObjectId
 from typing import Optional, List
@@ -21,8 +26,11 @@ from app.services.spaces_service import (
 )
 from app.services.image_service import optimize_image_from_url, optimize_image_from_bytes
 from app.services.mongo_service import get_candidates_grouped_paginated, collection, soft_delete_candidate, get_deletion_stats, get_deletion_stats_by_email, save_failed_image, get_failed_images, update_failed_image_status, move_candidate_to_processed, get_processed_candidates, get_global_stats, add_manual_processed_candidate, get_not_found_candidates_paginated, resolve_not_found_candidates
+from app.services.mongo_service import add_warehouse_candidate, WAREHOUSE_LOTE
 from app.services.mysql_stats_service import save_stats_snapshot
+from app.services.bigcommerce_service import search_products_by_brand_and_sku
 from app.api.bigcommerce import process_bigcommerce_upload
+from app.config import WAREHOUSE_API_KEY
 
 router = APIRouter()
 
@@ -429,6 +437,129 @@ async def upload_product_image_endpoint(
         "candidates": created,
         "failed": failed,
         "resolvedNotFound": resolved_not_found
+    }
+
+
+WAREHOUSE_MAX_PHOTO_BYTES = 15 * 1024 * 1024
+
+
+def _prepare_warehouse_photo(contents: bytes) -> bytes:
+    """
+    Valida la foto y la normaliza a JPEG. Aplica la rotación EXIF del teléfono para que
+    la imagen no quede de lado cuando después se optimice (el pipeline ignora EXIF).
+    """
+    if not contents:
+        raise ValueError("Archivo vacío")
+    if len(contents) > WAREHOUSE_MAX_PHOTO_BYTES:
+        raise ValueError(f"La foto supera el máximo de {WAREHOUSE_MAX_PHOTO_BYTES // (1024 * 1024)} MB")
+    try:
+        img = Image.open(BytesIO(contents))
+        img.load()
+    except Exception:
+        raise ValueError("El archivo no es una imagen válida")
+
+    img = ImageOps.exif_transpose(img)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
+
+@router.post("/warehouse-upload", summary="Subir fotos del equipo de Warehouse como candidatos pendientes")
+def warehouse_upload(
+    background_tasks: BackgroundTasks,
+    brand: str = Form(..., description="Marca del producto"),
+    mpn: str = Form(..., description="MPN/SKU del producto"),
+    user_id: Optional[str] = Form(None, description="ID de quien tomó las fotos (opcional)"),
+    user_name: Optional[str] = Form(None, description="Nombre de quien tomó las fotos (opcional)"),
+    photo1: UploadFile = File(..., description="Foto 1 (obligatoria)"),
+    photo2: Optional[UploadFile] = File(None, description="Foto 2 (opcional)"),
+    photo3: Optional[UploadFile] = File(None, description="Foto 3 (opcional)"),
+    x_api_key: Optional[str] = Header(None, description="API Key de Warehouse"),
+):
+    """
+    Recibe de 1 a 3 fotos de un producto tomadas por el equipo de Warehouse y las guarda
+    como candidatos PENDIENTES en `image_candidates` (lote fijo APP001, source="warehouse").
+    Pasan por la misma aprobación que los candidatos del scraper.
+
+    Por cada foto:
+    1. Valida que sea una imagen (máx. 15 MB) y la normaliza a JPEG con la rotación del teléfono
+    2. La sube a Digital Ocean Spaces (sin optimizar: eso ocurre al aprobarla)
+    3. Crea el candidato pendiente
+
+    Si el producto (brand + mpn) no existe en Products, se rechaza con 404.
+    Si una foto falla, las demás continúan; `ok` es true solo si todas se subieron.
+
+    **Respuesta:**
+    ```json
+    { "ok": true, "upload_id": "app-...", "photos": [
+        { "slot": 1, "ok": true, "url": "https://...", "candidate_id": "..." },
+        { "slot": 2, "ok": false, "error": "..." } ] }
+    ```
+    """
+    if not WAREHOUSE_API_KEY:
+        raise HTTPException(status_code=503, detail="WAREHOUSE_API_KEY no está configurada en el servidor")
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="x-api-key header requerido")
+    if not secrets.compare_digest(x_api_key, WAREHOUSE_API_KEY):
+        raise HTTPException(status_code=403, detail="x-api-key inválida o no autorizada")
+
+    brand = brand.strip()
+    mpn = mpn.strip()
+    user_id = (user_id or "").strip() or None
+    user_name = (user_name or "").strip() or None
+    if not brand or not mpn:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "brand y mpn no pueden estar vacíos"})
+
+    products = search_products_by_brand_and_sku(brand, mpn)
+    if not products:
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "error": f"Producto no encontrado: brand={brand}, mpn={mpn}"}
+        )
+
+    # Guardar con la marca/MPN del catálogo para que se agrupe con los candidatos del scraper
+    product = products[0]
+    brand = product.get("BRAND") or brand
+    mpn = product.get("MPN") or mpn
+
+    upload_id = f"app-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    photos = []
+
+    for slot, photo in enumerate([photo1, photo2, photo3], start=1):
+        if photo is None or not photo.filename:
+            continue
+
+        filename = None
+        image_url = None
+        try:
+            jpeg_bytes = _prepare_warehouse_photo(photo.file.read())
+            filename = f"APP_{brand}_{mpn}_{upload_id}_slot{slot}.jpg"
+            image_url = upload_image_to_spaces(jpeg_bytes, filename, "image/jpeg")
+            candidate = add_warehouse_candidate(
+                brand, mpn, image_url, upload_id, slot, user_id, user_name, product
+            )
+            photos.append({"slot": slot, "ok": True, "url": image_url, "candidate_id": str(candidate["_id"])})
+        except Exception as e:
+            # Si la foto alcanzó a subirse a Spaces pero falló después, no dejarla huérfana
+            if image_url and filename:
+                try:
+                    delete_image_from_spaces(filename)
+                except Exception as del_e:
+                    print(f"  ⚠ Error eliminando foto de Spaces tras fallo: {del_e}")
+            photos.append({"slot": slot, "ok": False, "error": str(e)})
+
+    if any(p["ok"] for p in photos):
+        background_tasks.add_task(save_stats_snapshot, "warehouse_upload", brand=brand, mpn=mpn)
+
+    return {
+        "ok": bool(photos) and all(p["ok"] for p in photos),
+        "upload_id": upload_id,
+        "lote": WAREHOUSE_LOTE,
+        "brand": brand,
+        "mpn": mpn,
+        "photos": photos,
     }
 
 

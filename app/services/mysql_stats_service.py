@@ -48,6 +48,9 @@ STATS_COLUMNS = {
     "totalManualDiagrams":     "total_manual_diagrams",
     "manualDiagramsPrimary":   "manual_diagrams_primary",
     "manualDiagramsSecondary": "manual_diagrams_secondary",
+    "warehousePending":        "warehouse_pending",
+    "warehouseApproved":       "warehouse_approved",
+    "warehouseRejected":       "warehouse_rejected",
 }
 
 _stats_columns_sql = ",\n".join(f"  `{col}` int(11) NOT NULL DEFAULT 0" for col in STATS_COLUMNS.values())
@@ -91,6 +94,7 @@ EVENT_LABELS = {
     "mark_as_processed":   "Lote marcado como procesado",
     "failed_image_status": "Cambio de estado de imagen fallida",
     "manual_sync":         "Sincronización manual",
+    "warehouse_upload":    "Fotos subidas por Warehouse",
 }
 
 _event_label_sql = "CASE s.`event` " + " ".join(
@@ -188,10 +192,24 @@ def create_powerbi_views(cursor):
         logger.error(f"Error creando vistas de Power BI: {e}")
 
 
+def _add_missing_columns(cursor):
+    """Agrega a la tabla ya existente las columnas de STATS_COLUMNS que se sumaron después de crearla."""
+    cursor.execute(
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s",
+        (TABLE_NAME,),
+    )
+    existing = {row[0] for row in cursor.fetchall()}
+    for col in STATS_COLUMNS.values():
+        if col not in existing:
+            cursor.execute(f"ALTER TABLE `{TABLE_NAME}` ADD COLUMN `{col}` int(11) NOT NULL DEFAULT 0 AFTER `chunk_id`")
+            logger.info(f"Columna `{col}` agregada a {TABLE_NAME}")
+
+
 def _ensure_table(cursor):
     global _table_ready
     if not _table_ready:
         cursor.execute(CREATE_TABLE_SQL)
+        _add_missing_columns(cursor)
         create_powerbi_views(cursor)
         _table_ready = True
 

@@ -579,6 +579,50 @@ def resolve_not_found_candidates(brand: str, mpn: str, images: list, email: str 
     return moved_ids
 
 
+WAREHOUSE_LOTE = "APP001"
+WAREHOUSE_SOURCE = "warehouse"
+
+
+def add_warehouse_candidate(brand: str, mpn: str, image_url: str, upload_id: str, slot: int,
+                            user_id: str, user_name: str, product: dict = None):
+    """
+    Crea un candidato PENDIENTE en image_candidates a partir de una foto que el equipo
+    de Warehouse tomó con el teléfono. Pasa por la misma aprobación que los candidatos
+    del scraper; se identifica por source="warehouse" y lote fijo WAREHOUSE_LOTE.
+
+    :param product: producto de la colección Products (para storeId/productId), opcional
+    """
+    from datetime import datetime
+
+    candidate = {
+        "storeId": (product or {}).get("STOREID"),
+        "productId": (product or {}).get("ID"),
+        "brand": brand,
+        "mpn": mpn,
+        "domain": None,
+        "pageUrl": None,
+        "pageTitle": None,
+        "pageSnippet": None,
+        "categoryGuess": None,
+        "imageUrl": image_url,
+        "thumbnailUrl": None,
+        "searchRank": None,
+        "scoreProductPage": None,
+        "createdAt": datetime.utcnow(),
+        "email": None,
+        "lote": WAREHOUSE_LOTE,
+        "source": WAREHOUSE_SOURCE,
+        "isDiagram": False,
+        "uploadId": upload_id,
+        "slot": slot,
+        "uploadedBy": {"userId": user_id, "userName": user_name},
+    }
+
+    result = collection.insert_one(candidate)
+    candidate["_id"] = result.inserted_id
+    return candidate
+
+
 def get_global_stats():
     """
     Devuelve totales globales basados en los candidatos originales:
@@ -608,6 +652,10 @@ def get_global_stats():
     - totalManualImages / manualImagesPrimary / manualImagesSecondary
     - totalManualDiagrams / manualDiagramsPrimary / manualDiagramsSecondary
 
+    Fotos tomadas por el equipo de Warehouse (source="warehouse", lote APP001). Cuentan dentro de
+    pending/processed/deleted, pero NO dentro de las métricas del bot:
+    - warehousePending / warehouseApproved / warehouseRejected
+
     Nota: las estadísticas de aprobación/rechazo del QA posterior sobre imágenes ya procesadas
     automáticamente (revisión humana tipo "images-update") viven en el backend de task-hub,
     no en esta base de datos, así que no se incluyen acá.
@@ -630,10 +678,16 @@ def get_global_stats():
     unique_skus = len(sku_groups)
     secondary_images = sum(max(g["count"] - 1, 0) for g in sku_groups)
 
-    # Candidatos de origen bot (no manual) que llegaron a processed_candidates = aprobados por el usuario
-    user_approved_candidates = processed_candidates_collection.count_documents({"source": {"$ne": "manual_upload"}})
-    user_rejected_candidates = deleted  # deleted_candidates solo contiene candidatos de origen bot
-    bot_found_candidates = pending + user_approved_candidates + user_rejected_candidates
+    # Candidatos de origen bot (ni subida manual ni Warehouse) que llegaron a processed_candidates = aprobados por el usuario
+    user_approved_candidates = processed_candidates_collection.count_documents({"source": {"$nin": ["manual_upload", WAREHOUSE_SOURCE]}})
+
+    # Fotos de Warehouse: pasan por la misma aprobación, pero no las encontró el bot
+    warehouse_pending  = collection.count_documents({"source": WAREHOUSE_SOURCE})
+    warehouse_approved = processed_candidates_collection.count_documents({"source": WAREHOUSE_SOURCE})
+    warehouse_rejected = deleted_candidates_collection.count_documents({"source": WAREHOUSE_SOURCE})
+
+    user_rejected_candidates = deleted - warehouse_rejected
+    bot_found_candidates = (pending - warehouse_pending) + user_approved_candidates + user_rejected_candidates
 
     manual_images_primary     = processed_candidates_collection.count_documents({"source": "manual_upload", "isDiagram": False, "isPrimaryManual": True})
     manual_images_secondary   = processed_candidates_collection.count_documents({"source": "manual_upload", "isDiagram": False, "isPrimaryManual": False})
@@ -665,4 +719,8 @@ def get_global_stats():
         "totalManualDiagrams":        manual_diagrams_primary + manual_diagrams_secondary,
         "manualDiagramsPrimary":      manual_diagrams_primary,
         "manualDiagramsSecondary":    manual_diagrams_secondary,
+
+        "warehousePending":  warehouse_pending,
+        "warehouseApproved": warehouse_approved,
+        "warehouseRejected": warehouse_rejected,
     }
