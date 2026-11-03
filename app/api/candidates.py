@@ -28,6 +28,7 @@ from app.services.image_service import optimize_image_from_url, optimize_image_f
 from app.services.mongo_service import get_candidates_grouped_paginated, collection, soft_delete_candidate, get_deletion_stats, get_deletion_stats_by_email, save_failed_image, get_failed_images, update_failed_image_status, move_candidate_to_processed, get_processed_candidates, get_global_stats, add_manual_processed_candidate, get_not_found_candidates_paginated, resolve_not_found_candidates
 from app.services.mongo_service import add_warehouse_candidate, WAREHOUSE_LOTE
 from app.services.mysql_stats_service import save_stats_snapshot
+from app.services.review_approvals_sync import sync_review_approvals
 from app.services.bigcommerce_service import search_products_by_brand_and_sku
 from app.api.bigcommerce import process_bigcommerce_upload
 from app.config import WAREHOUSE_API_KEY
@@ -76,6 +77,7 @@ class ImageProcessingData(BaseModel):
 
 class ImageProcessingRequest(BaseModel):
     chunkId: str = Field(..., min_length=1, description="ID único del lote de procesamiento")
+    email: Optional[str] = Field(None, description="Email del usuario que aprueba el lote")
     data: ImageProcessingData
     
     @validator('chunkId')
@@ -123,9 +125,10 @@ async def process_images_batch(request: ImageProcessingRequest, background_tasks
     """
     try:
         chunk_id = request.chunkId
+        approved_by = (request.email or "").strip() or None
         results = request.data.results
         processed_results = []
-        
+
         # Procesar cada resultado (brand + mpn + imágenes)
         for result_idx, result in enumerate(results):
             brand = result.brand
@@ -188,7 +191,8 @@ async def process_images_batch(request: ImageProcessingRequest, background_tasks
                         "mpn": mpn,
                         "processedImageUrls": [img["imageUrl"] for img in processed_images],
                         "totalImagesProcessed": len(processed_images),
-                        "chunkId": chunk_id
+                        "chunkId": chunk_id,
+                        "approvedBy": approved_by
                     }
                     moved_ids = move_candidate_to_processed(
                         brand, mpn, [img["originalImageUrl"] for img in processed_images], processed_data, candidate_id
@@ -209,7 +213,7 @@ async def process_images_batch(request: ImageProcessingRequest, background_tasks
         
         print(f"\n✓ Lote {chunk_id} completado exitosamente\n")
 
-        background_tasks.add_task(save_stats_snapshot, "process_images", chunk_id=chunk_id, **_single_product(results))
+        background_tasks.add_task(save_stats_snapshot, "process_images", email=approved_by, chunk_id=chunk_id, **_single_product(results))
 
         return ImageProcessingResponse(
             chunkId=chunk_id,
@@ -247,9 +251,10 @@ async def process_mark_as_processed(request: ImageProcessingRequest, background_
     """
     try:
         chunk_id = request.chunkId
+        approved_by = (request.email or "").strip() or None
         results = request.data.results
         processed_results = []
-        
+
         print(f"\n[{chunk_id}] Marcando lote como procesado (sin optimización)")
         
         # Procesar cada resultado (brand + mpn)
@@ -270,7 +275,8 @@ async def process_mark_as_processed(request: ImageProcessingRequest, background_
                     "originalImageUrls": image_urls,
                     "totalImagesProcessed": len(image_urls),
                     "chunkId": chunk_id,
-                    "processedMethod": "mark_as_processed"  # Indica que solo fue marcado, no optimizado
+                    "processedMethod": "mark_as_processed",  # Indica que solo fue marcado, no optimizado
+                    "approvedBy": approved_by
                 }
                 
                 moved_ids = move_candidate_to_processed(brand, mpn, image_urls, processed_data, candidate_id)
@@ -299,7 +305,7 @@ async def process_mark_as_processed(request: ImageProcessingRequest, background_
         
         print(f"\n✓ Lote {chunk_id} marcado como procesado (sin optimización)\n")
 
-        background_tasks.add_task(save_stats_snapshot, "mark_as_processed", chunk_id=chunk_id, **_single_product(results))
+        background_tasks.add_task(save_stats_snapshot, "mark_as_processed", email=approved_by, chunk_id=chunk_id, **_single_product(results))
 
         return ImageProcessingResponse(
             chunkId=chunk_id,
@@ -673,6 +679,21 @@ def sync_global_stats():
     if stats is None:
         raise HTTPException(status_code=500, detail="No se pudo guardar el snapshot en MySQL (ver logs)")
     return stats
+
+
+@router.post("/stats/sync-reviews", summary="Sincronizar revisiones de task-hub (images-update) a MySQL")
+def sync_task_hub_reviews():
+    """
+    Copia las aprobaciones/rechazos de la revisión humana "images-update" de task-hub
+    a la tabla MySQL `image_review_approvals` (upsert por id, no duplica). Para Power BI
+    usar la vista `vw_image_review_aprobaciones`.
+
+    Corre sola cada `TASKHUB_SYNC_MINUTES` (15 por defecto); este endpoint la fuerza.
+    """
+    summary = sync_review_approvals()
+    if summary is None:
+        raise HTTPException(status_code=500, detail="No se pudo sincronizar (ver logs; puede que ya haya un sync en curso)")
+    return summary
 
 
 @router.get("/deletion-stats", summary="Listar estadísticas de eliminaciones")

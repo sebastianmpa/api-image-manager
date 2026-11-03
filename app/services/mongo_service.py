@@ -272,6 +272,7 @@ def move_candidate_to_processed(brand: str, mpn: str, image_urls: list, processe
         processed_candidate["processedAt"] = now
         processed_candidate["processedData"] = processed_data
         processed_candidate["originalId"] = candidate["_id"]
+        processed_candidate["approvedBy"] = processed_data.get("approvedBy")
         processed.append(processed_candidate)
 
     processed_candidates_collection.insert_many(processed)
