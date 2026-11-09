@@ -382,6 +382,14 @@ async def upload_product_image_endpoint(
             detail=f"Debe enviar un valor de is_diagram por cada archivo: {len(files)} archivo(s) pero {len(is_diagram)} valor(es) de is_diagram"
         )
 
+    # Validar antes de subir nada: si el producto no está en el catálogo, la imagen
+    # quedaría aprobada y contada como subida manual pero nunca llegaría a BigCommerce.
+    if not search_products_by_brand_and_sku(brand, mpn):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No existe un producto con brand={brand} y mpn/sku={mpn} en el catálogo. Revisa la marca y el código."
+        )
+
     import time
     import uuid
 

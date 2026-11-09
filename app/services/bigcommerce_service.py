@@ -70,9 +70,17 @@ atexit.register(_close_mongo_client)
 KNOWN_BRAND_GROUPS = [
     ["BRIGGS", "BRIGGS & STRATTON", "BRIGGS&STRATTON", "BRIGGS AND STRATTON"],
     ["ECHO", "ECHO INC"],
-    ["HONDA", "HONDA MOTOR"],
+    ["HONDA", "HONDA MOTOR", "Honda Engines"],
     ["HUSTLER", "HUSTLER TURF"],
     ["SCAG", "SCAG POWER EQUIPMENT"],
+    # Marcas que en Products están combinadas o con minúsculas: se escriben tal cual
+    # aparecen en el catálogo porque la búsqueda ($in) distingue mayúsculas.
+    ["RYOBI-RIDGID", "RYOBI", "RIDGID"],
+    ["DEWALT / BLACK & DECKER", "DEWALT", "BLACK & DECKER", "BLACK AND DECKER"],
+    ["Troy Bilt - MTD", "TROY BILT", "TROY-BILT", "MTD"],
+    ["Tuff Torq", "TUFF TORQ"],
+    ["Kohler Engines", "KOHLER"],
+    ["DR Power Equipment", "DR POWER", "DR POWER EQUIPMENT"],
 ]
 
 
@@ -88,7 +96,7 @@ def _normalize_brand(brand: str) -> List[str]:
     # brand_clean coincidía EXACTAMENTE con la forma corta (ej. "BRIGGS"), así que
     # "BRIGGS AND STRATTON" nunca lo activaba.
     for group in KNOWN_BRAND_GROUPS:
-        if brand_clean in group:
+        if brand_clean in (g.upper() for g in group):
             variants.extend(group)
             break
 
