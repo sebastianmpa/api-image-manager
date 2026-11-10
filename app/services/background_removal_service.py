@@ -447,10 +447,13 @@ def remove_bg_combined(img: Image.Image, quality: str = "high") -> Image.Image:
         
         rembg_mask = img_no_bg.split()[3]
         
-        # Combinar máscaras: 95% Threshold (agresivo) + 5% Rembg (suaviza)
-        threshold_array = np.array(threshold_mask, dtype=np.float32)
-        rembg_array = np.array(rembg_mask, dtype=np.float32)
-        combined_mask = (threshold_array * 0.95 + rembg_array * 0.05).astype(np.uint8)
+        # Combinar máscaras: un píxel es producto si CUALQUIERA de las dos lo detecta.
+        # Antes era 95% Threshold + 5% Rembg: el threshold toma como fondo todo lo más
+        # claro que (fondo - 50), así que los productos blancos/gris claro quedaban
+        # pintados de blanco y solo sobrevivían sombras y detalles oscuros.
+        threshold_array = np.array(threshold_mask, dtype=np.uint8)
+        rembg_array = np.array(rembg_mask, dtype=np.uint8)
+        combined_mask = np.maximum(threshold_array, rembg_array)
         combined_mask_img = Image.fromarray(combined_mask, mode='L')
         
         result = img.convert('RGBA')
