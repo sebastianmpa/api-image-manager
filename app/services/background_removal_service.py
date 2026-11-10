@@ -390,6 +390,43 @@ def _is_background_white(img_array: np.ndarray, margin: int = 50, threshold: int
     return white_percentage > 70
 
 
+def _light_product_mask(img_array: np.ndarray, bg_color: tuple, rembg_mask: np.ndarray,
+                        threshold: int, tolerance: int = 12, min_area_ratio: float = 0.01) -> np.ndarray:
+    """
+    Máscara de producto para piezas BLANCAS o gris claro sobre fondo blanco.
+
+    El threshold adaptativo toma como fondo todo lo más claro que (fondo - 50), así que una
+    pieza blanca (~230 sobre fondo ~254) desaparece; rembg tampoco siempre la detecta.
+    Acá el fondo es solo lo que es casi del color del fondo (±tolerance) Y está conectado
+    al borde de la imagen; todo lo demás es producto.
+
+    Para no revivir marcas de agua, cada región se conserva solo si es grande
+    (>= min_area_ratio del área), si rembg la ve como producto o si es oscura (< threshold).
+
+    Returns:
+        Máscara uint8 (0 fondo, 255 producto)
+    """
+    gray = np.dot(img_array[..., :3], [0.299, 0.587, 0.114])
+    bg_gray = float(np.dot(bg_color, [0.299, 0.587, 0.114]))
+
+    near_bg = gray >= bg_gray - tolerance
+    labels, _ = ndi.label(near_bg)
+    border_labels = np.unique(np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]]))
+    background = np.isin(labels, border_labels[border_labels > 0])
+
+    regions, count = ndi.label(~background)
+    if count == 0:
+        return np.zeros(gray.shape, dtype=np.uint8)
+    idx = np.arange(1, count + 1)
+    area = ndi.sum(np.ones_like(gray), regions, idx)
+    rembg_share = ndi.mean(rembg_mask > 128, regions, idx)
+    mean_gray = ndi.mean(gray, regions, idx)
+    keep = (area >= min_area_ratio * gray.size) | (rembg_share > 0.5) | (mean_gray < threshold)
+
+    mask = np.isin(regions, idx[keep]).astype(np.uint8) * 255
+    return np.array(Image.fromarray(mask).filter(ImageFilter.GaussianBlur(radius=1)), dtype=np.uint8)
+
+
 def remove_bg_combined(img: Image.Image, quality: str = "high") -> Image.Image:
     """
     Remover fondo de forma INTELIGENTE según el color del fondo.
@@ -447,13 +484,16 @@ def remove_bg_combined(img: Image.Image, quality: str = "high") -> Image.Image:
         
         rembg_mask = img_no_bg.split()[3]
         
-        # Combinar máscaras: un píxel es producto si CUALQUIERA de las dos lo detecta.
-        # Antes era 95% Threshold + 5% Rembg: el threshold toma como fondo todo lo más
-        # claro que (fondo - 50), así que los productos blancos/gris claro quedaban
-        # pintados de blanco y solo sobrevivían sombras y detalles oscuros.
+        # Combinar máscaras: un píxel es producto si CUALQUIERA lo detecta (threshold,
+        # rembg o la máscara de piezas claras). Antes era 95% Threshold + 5% Rembg: el
+        # threshold toma como fondo todo lo más claro que (fondo - 50), así que los
+        # productos blancos/gris claro quedaban pintados de blanco y solo sobrevivían
+        # sombras y detalles oscuros.
         threshold_array = np.array(threshold_mask, dtype=np.uint8)
         rembg_array = np.array(rembg_mask, dtype=np.uint8)
-        combined_mask = np.maximum(threshold_array, rembg_array)
+        bg_color = _get_background_color(img_array, margin=50)
+        light_array = _light_product_mask(img_array, bg_color, rembg_array, _calculate_adaptive_threshold(bg_color))
+        combined_mask = np.maximum(np.maximum(threshold_array, rembg_array), light_array)
         combined_mask_img = Image.fromarray(combined_mask, mode='L')
         
         result = img.convert('RGBA')
