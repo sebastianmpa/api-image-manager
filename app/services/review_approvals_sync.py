@@ -56,12 +56,39 @@ CREATE TABLE IF NOT EXISTS `{TABLE_NAME}` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
+# Aprobaciones automáticas que hace el bot con POST /candidates/approve-images (una fila por imagen aprobada).
+CANDIDATE_APPROVALS_TABLE = "image_candidate_approvals"
+
+CREATE_CANDIDATE_APPROVALS_SQL = f"""
+CREATE TABLE IF NOT EXISTS `{CANDIDATE_APPROVALS_TABLE}` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `chunk_id` varchar(100) DEFAULT NULL,
+  `candidate_id` varchar(24) DEFAULT NULL,
+  `brand` varchar(100) DEFAULT NULL,
+  `mpn` varchar(100) DEFAULT NULL,
+  `image_url` text,
+  `source` varchar(50) DEFAULT NULL,
+  `lote` varchar(50) DEFAULT NULL,
+  `email` varchar(100) DEFAULT NULL,
+  `bc_stores_ok` int(11) NOT NULL DEFAULT 0,
+  `bc_stores_failed` int(11) NOT NULL DEFAULT 0,
+  `approved_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `idx_approved_at` (`approved_at`),
+  KEY `idx_email` (`email`),
+  KEY `idx_candidate_id` (`candidate_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+
 # Vista para Power BI: sin JSON, con el estado en texto y `fecha` para relacionar con
 # vw_image_manager_calendario. Contar filas = contar imágenes (no productos).
+# Junta las revisiones humanas de task-hub con las aprobaciones automáticas del bot (/approve-images);
+# `origen` las distingue.
 REVIEWS_VIEW_SQL = f"""
 CREATE OR REPLACE VIEW `{REVIEWS_VIEW}` AS
 SELECT
   r.`id`,
+  'Revisión task-hub (images-update)' AS `origen`,
   r.`chunk_id`,
   r.`brand`,
   r.`sku`,
@@ -77,6 +104,21 @@ SELECT
   r.`created_at`
 FROM `{TABLE_NAME}` r
 WHERE r.`deleted_at` IS NULL
+UNION ALL
+SELECT
+  CONCAT('cand-', a.`id`),
+  CASE WHEN a.`source` = 'warehouse' THEN 'Aprobación automática (bot) - Warehouse' ELSE 'Aprobación automática (bot)' END,
+  a.`chunk_id`,
+  a.`brand`,
+  a.`mpn`,
+  NULL,
+  a.`image_url`,
+  'Aprobada', 1, 0, 0,
+  a.`email`,
+  a.`approved_at`,
+  DATE(a.`approved_at`),
+  a.`approved_at`
+FROM `{CANDIDATE_APPROVALS_TABLE}` a
 """
 
 COLUMNS = [
@@ -151,11 +193,46 @@ def fetch_review_records(task_type: str = TASK_TYPE) -> list:
 
 
 def _ensure_table(cursor):
+    """Crea las dos tablas que alimentan la vista (la vista falla si falta alguna) y la vista."""
     global _table_ready
     if not _table_ready:
         cursor.execute(CREATE_TABLE_SQL)
+        cursor.execute(CREATE_CANDIDATE_APPROVALS_SQL)
         cursor.execute(REVIEWS_VIEW_SQL)
         _table_ready = True
+
+
+def save_candidate_approvals(rows: list) -> bool:
+    """
+    Guarda en image_candidate_approvals las imágenes que el bot aprobó con /approve-images.
+    Cada fila es un dict con chunk_id, candidate_id, brand, mpn, image_url, source, lote,
+    email, bc_stores_ok y bc_stores_failed. Nunca lanza: si MySQL falla solo se loguea.
+    """
+    if not rows:
+        return True
+    columns = ["chunk_id", "candidate_id", "brand", "mpn", "image_url", "source", "lote",
+               "email", "bc_stores_ok", "bc_stores_failed"]
+    connection = None
+    try:
+        connection = _get_connection()
+        cursor = connection.cursor()
+        _ensure_table(cursor)
+        cursor.executemany(
+            f"INSERT INTO `{CANDIDATE_APPROVALS_TABLE}` ({', '.join(f'`{c}`' for c in columns)}) "
+            f"VALUES ({', '.join(['%s'] * len(columns))})",
+            [[row.get(c) for c in columns] for row in rows],
+        )
+        connection.commit()
+        logger.info(f"{len(rows)} aprobación(es) de candidatos guardada(s) en MySQL")
+        return True
+    except MySQLError as e:
+        logger.error(f"Error MySQL guardando aprobaciones de candidatos: {e}")
+    except Exception as e:
+        logger.error(f"Error guardando aprobaciones de candidatos: {e}", exc_info=True)
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+    return False
 
 
 def sync_review_approvals() -> Optional[dict]:

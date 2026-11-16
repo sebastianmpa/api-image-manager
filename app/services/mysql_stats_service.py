@@ -95,6 +95,7 @@ EVENT_LABELS = {
     "failed_image_status": "Cambio de estado de imagen fallida",
     "manual_sync":         "Sincronización manual",
     "warehouse_upload":    "Fotos subidas por Warehouse",
+    "approve_images":      "Aprobación automática (bot) y subida a BigCommerce",
 }
 
 _event_label_sql = "CASE s.`event` " + " ".join(

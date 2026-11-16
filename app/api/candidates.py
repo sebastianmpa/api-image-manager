@@ -28,8 +28,8 @@ from app.services.image_service import optimize_image_from_url, optimize_image_f
 from app.services.mongo_service import get_candidates_grouped_paginated, collection, soft_delete_candidate, get_deletion_stats, get_deletion_stats_by_email, save_failed_image, get_failed_images, update_failed_image_status, move_candidate_to_processed, get_processed_candidates, get_global_stats, add_manual_processed_candidate, get_not_found_candidates_paginated, resolve_not_found_candidates
 from app.services.mongo_service import add_warehouse_candidate, WAREHOUSE_LOTE
 from app.services.mysql_stats_service import save_stats_snapshot
-from app.services.review_approvals_sync import sync_review_approvals
-from app.services.bigcommerce_service import search_products_by_brand_and_sku
+from app.services.review_approvals_sync import sync_review_approvals, save_candidate_approvals
+from app.services.bigcommerce_service import search_products_by_brand_and_sku, process_bigcommerce_image_update
 from app.api.bigcommerce import process_bigcommerce_upload
 from app.config import WAREHOUSE_API_KEY
 
@@ -89,6 +89,15 @@ class ImageProcessingRequest(BaseModel):
 class ImageProcessingResponse(BaseModel):
     chunkId: str
     data: dict
+
+def _require_api_key(x_api_key: Optional[str]):
+    """Valida el header x-api-key contra WAREHOUSE_API_KEY (la usan /warehouse-upload y /approve-images)."""
+    if not WAREHOUSE_API_KEY:
+        raise HTTPException(status_code=503, detail="WAREHOUSE_API_KEY no está configurada en el servidor")
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="x-api-key header requerido")
+    if not secrets.compare_digest(x_api_key, WAREHOUSE_API_KEY):
+        raise HTTPException(status_code=403, detail="x-api-key inválida o no autorizada")
 
 def _single_product(results: List[ImageResult]) -> dict:
     """brand/mpn para el snapshot de estadísticas solo si el lote trae un único producto."""
@@ -323,6 +332,124 @@ async def process_mark_as_processed(request: ImageProcessingRequest, background_
         )
 
 
+class ApproveImagesRequest(ImageProcessingRequest):
+    email: str = Field(..., min_length=1, description="Identificador del bot que aprueba (ej. bot-aprobacion@...); obligatorio")
+
+
+@router.post("/approve-images", summary="Aprobación automática (bot): aprobar candidatos y subirlos a BigCommerce (con API key)")
+def approve_images(
+    request: ApproveImagesRequest,
+    background_tasks: BackgroundTasks,
+    x_api_key: Optional[str] = Header(None, description="API Key (la misma de /warehouse-upload)"),
+):
+    """
+    Pensado para que otra aplicación (bot) apruebe imágenes candidatas AUTOMÁTICAMENTE, haciendo
+    todo el proceso en una sola llamada. Por cada URL de `imageUrls`:
+    1. Verifica que sea un candidato PENDIENTE de ese brand+mpn en `image_candidates`
+    2. La sube TAL CUAL (sin optimizar) a BigCommerce, en todas las tiendas donde exista el producto
+    3. Si BigCommerce la aceptó en al menos una tienda, mueve el candidato a `processed_candidates`
+       con `approvedBy` = email. Si falló, el candidato queda pendiente para reintentar.
+
+    Las aprobadas se guardan en MySQL (`image_candidate_approvals`, visibles en la vista
+    `vw_image_review_aprobaciones` con origen "Aprobación automática (bot)") y se guarda un snapshot
+    de estadísticas con evento `approve_images`. `email` identifica al bot que aprobó.
+
+    El cuerpo es igual al de `/process-images`, pero `email` es obligatorio.
+    `ok` es true solo si todas las imágenes quedaron aprobadas.
+    """
+    _require_api_key(x_api_key)
+
+    chunk_id = request.chunkId
+    email = request.email.strip()
+    if not email:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "email no puede estar vacío"})
+
+    results_out = []
+    approvals = []
+
+    for result in request.data.results:
+        brand, mpn = result.brand, result.mpn
+        images_out = []
+
+        if not search_products_by_brand_and_sku(brand, mpn):
+            results_out.append({
+                "brand": brand, "mpn": mpn, "ok": False,
+                "error": f"No existe un producto con brand={brand} y mpn/sku={mpn} en el catálogo",
+                "images": [{"imageUrl": url, "ok": False, "error": "Producto no existe"} for url in result.imageUrls],
+            })
+            continue
+
+        pending = {c["imageUrl"]: c for c in collection.find(
+            {"brand": brand, "mpn": mpn, "imageUrl": {"$in": result.imageUrls}}
+        )}
+
+        for url in result.imageUrls:
+            candidate = pending.get(url)
+            if not candidate:
+                images_out.append({"imageUrl": url, "ok": False,
+                                   "error": "No es un candidato pendiente de este brand+mpn (ya aprobado, rechazado o no existe)"})
+                continue
+
+            task_id = f"approve-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+            try:
+                summary = process_bigcommerce_image_update(
+                    brand=brand, sku=mpn, processed_image_url=url, task_id=task_id,
+                    is_diagram=bool(candidate.get("isDiagram")),
+                )
+            except Exception as e:
+                images_out.append({"imageUrl": url, "ok": False, "error": f"Error subiendo a BigCommerce: {e}"})
+                continue
+
+            stores_ok = sum(1 for s in summary["stores_processed"] if s.get("uploaded_image_id"))
+            stores_failed = len(summary["stores_processed"]) - stores_ok
+            if not stores_ok:
+                errors = summary["errors"] + [s["error"] for s in summary["stores_processed"] if s.get("error")]
+                images_out.append({"imageUrl": url, "ok": False,
+                                   "error": "BigCommerce no aceptó la imagen: " + ("; ".join(errors) or "sin detalle")})
+                continue
+
+            candidate_id = str(candidate["_id"])
+            moved_ids = move_candidate_to_processed(brand, mpn, [url], {
+                "brand": brand,
+                "mpn": mpn,
+                "originalImageUrls": [url],
+                "totalImagesProcessed": 1,
+                "chunkId": chunk_id,
+                "processedMethod": "approve_images",
+                "approvedBy": email,
+                "bigcommerceTaskId": task_id,
+                "bigcommerceStoresOk": stores_ok,
+                "bigcommerceStoresFailed": stores_failed,
+            }, candidate_id)
+            print(f"[{chunk_id}] ✓ Aprobada {brand}/{mpn} ({stores_ok} tienda(s) OK, {stores_failed} con error): {url}")
+
+            approvals.append({
+                "chunk_id": chunk_id, "candidate_id": candidate_id, "brand": brand, "mpn": mpn,
+                "image_url": url, "source": candidate.get("source"), "lote": candidate.get("lote"),
+                "email": email, "bc_stores_ok": stores_ok, "bc_stores_failed": stores_failed,
+            })
+            images_out.append({
+                "imageUrl": url, "ok": True, "candidateId": candidate_id, "movedCandidateIds": moved_ids,
+                "bigcommerce": {"storesOk": stores_ok, "storesFailed": stores_failed, "taskId": task_id},
+            })
+
+        results_out.append({"brand": brand, "mpn": mpn,
+                            "ok": bool(images_out) and all(i["ok"] for i in images_out), "images": images_out})
+
+    if approvals:
+        save_candidate_approvals(approvals)
+        background_tasks.add_task(save_stats_snapshot, "approve_images", email=email, chunk_id=chunk_id,
+                                  **_single_product(request.data.results))
+
+    return {
+        "ok": all(r["ok"] for r in results_out),
+        "chunkId": chunk_id,
+        "email": email,
+        "totalApproved": len(approvals),
+        "results": results_out,
+    }
+
+
 @router.post("/upload-image", summary="Subir imagen a DigitalOcean Spaces")
 async def upload_image_to_spaces_endpoint(file: UploadFile = File(...)):
     """Sube una imagen a DigitalOcean Spaces y retorna la URL pública."""
@@ -512,12 +639,7 @@ def warehouse_upload(
         { "slot": 2, "ok": false, "error": "..." } ] }
     ```
     """
-    if not WAREHOUSE_API_KEY:
-        raise HTTPException(status_code=503, detail="WAREHOUSE_API_KEY no está configurada en el servidor")
-    if not x_api_key:
-        raise HTTPException(status_code=401, detail="x-api-key header requerido")
-    if not secrets.compare_digest(x_api_key, WAREHOUSE_API_KEY):
-        raise HTTPException(status_code=403, detail="x-api-key inválida o no autorizada")
+    _require_api_key(x_api_key)
 
     brand = brand.strip()
     mpn = mpn.strip()
