@@ -26,7 +26,10 @@ from app.services.spaces_service import (
 )
 from app.services.image_service import optimize_image_from_url, optimize_image_from_bytes
 from app.services.mongo_service import get_candidates_grouped_paginated, collection, soft_delete_candidate, get_deletion_stats, get_deletion_stats_by_email, save_failed_image, get_failed_images, update_failed_image_status, move_candidate_to_processed, get_processed_candidates, get_global_stats, add_manual_processed_candidate, get_not_found_candidates_paginated, resolve_not_found_candidates
-from app.services.mongo_service import add_warehouse_candidate, WAREHOUSE_LOTE
+from app.services.mongo_service import add_warehouse_candidate, WAREHOUSE_LOTE, processed_candidates_collection
+import logging
+
+logger = logging.getLogger(__name__)
 from app.services.mysql_stats_service import save_stats_snapshot
 from app.services.review_approvals_sync import sync_review_approvals, save_candidate_approvals
 from app.services.bigcommerce_service import search_products_by_brand_and_sku, process_bigcommerce_image_update
@@ -345,10 +348,15 @@ def approve_images(
     """
     Pensado para que otra aplicación (bot) apruebe imágenes candidatas AUTOMÁTICAMENTE, haciendo
     todo el proceso en una sola llamada. Por cada URL de `imageUrls`:
-    1. Verifica que sea un candidato PENDIENTE de ese brand+mpn en `image_candidates`
+    1. Verifica que el producto (brand+mpn) exista en el catálogo
     2. La sube TAL CUAL (sin optimizar) a BigCommerce, en todas las tiendas donde exista el producto
-    3. Si BigCommerce la aceptó en al menos una tienda, mueve el candidato a `processed_candidates`
-       con `approvedBy` = email. Si falló, el candidato queda pendiente para reintentar.
+    3. Si BigCommerce la aceptó en al menos una tienda:
+       - si el candidato seguía pendiente en `image_candidates`, lo mueve a `processed_candidates`
+       - si ya estaba en `processed_candidates` (lo marcó el front antes), le completa `approvedBy`
+         (si no tenía) y el resultado de BigCommerce
+       Si BigCommerce falló, no se cambia nada para poder reintentar.
+    Si la imagen ya la había subido este mismo endpoint antes, no se vuelve a subir
+    (responde ok con `alreadyUploaded: true`) para no duplicarla en BigCommerce.
 
     Las aprobadas se guardan en MySQL (`image_candidate_approvals`, visibles en la vista
     `vw_image_review_aprobaciones` con origen "Aprobación automática (bot)") y se guarda un snapshot
@@ -379,22 +387,28 @@ def approve_images(
             })
             continue
 
-        pending = {c["imageUrl"]: c for c in collection.find(
-            {"brand": brand, "mpn": mpn, "imageUrl": {"$in": result.imageUrls}}
-        )}
+        url_filter = {"brand": brand, "mpn": mpn, "imageUrl": {"$in": result.imageUrls}}
+        pending = {c["imageUrl"]: c for c in collection.find(url_filter)}
+        # Lo normal es que el front ya la haya marcado (mark_as_processed) antes de que llegue el bot
+        already_processed = {}
+        for c in processed_candidates_collection.find(url_filter).sort("processedAt", -1):
+            already_processed.setdefault(c["imageUrl"], c)
 
         for url in result.imageUrls:
             candidate = pending.get(url)
-            if not candidate:
-                images_out.append({"imageUrl": url, "ok": False,
-                                   "error": "No es un candidato pendiente de este brand+mpn (ya aprobado, rechazado o no existe)"})
+            processed_doc = None if candidate else already_processed.get(url)
+
+            if processed_doc and (processed_doc.get("processedData") or {}).get("bigcommerceStoresOk"):
+                # Ya la subió el bot antes: no se vuelve a subir para no duplicarla en BigCommerce
+                images_out.append({"imageUrl": url, "ok": True, "alreadyUploaded": True,
+                                   "candidateId": str(processed_doc["_id"])})
                 continue
 
             task_id = f"approve-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
             try:
                 summary = process_bigcommerce_image_update(
                     brand=brand, sku=mpn, processed_image_url=url, task_id=task_id,
-                    is_diagram=bool(candidate.get("isDiagram")),
+                    is_diagram=bool((candidate or processed_doc or {}).get("isDiagram")),
                 )
             except Exception as e:
                 images_out.append({"imageUrl": url, "ok": False, "error": f"Error subiendo a BigCommerce: {e}"})
@@ -408,24 +422,38 @@ def approve_images(
                                    "error": "BigCommerce no aceptó la imagen: " + ("; ".join(errors) or "sin detalle")})
                 continue
 
-            candidate_id = str(candidate["_id"])
-            moved_ids = move_candidate_to_processed(brand, mpn, [url], {
-                "brand": brand,
-                "mpn": mpn,
-                "originalImageUrls": [url],
-                "totalImagesProcessed": 1,
-                "chunkId": chunk_id,
+            bc_data = {
                 "processedMethod": "approve_images",
                 "approvedBy": email,
                 "bigcommerceTaskId": task_id,
                 "bigcommerceStoresOk": stores_ok,
                 "bigcommerceStoresFailed": stores_failed,
-            }, candidate_id)
-            print(f"[{chunk_id}] ✓ Aprobada {brand}/{mpn} ({stores_ok} tienda(s) OK, {stores_failed} con error): {url}")
+            }
+            moved_ids = []
+            if candidate:
+                candidate_id = str(candidate["_id"])
+                moved_ids = move_candidate_to_processed(brand, mpn, [url], {
+                    "brand": brand, "mpn": mpn, "originalImageUrls": [url],
+                    "totalImagesProcessed": 1, "chunkId": chunk_id, **bc_data,
+                }, candidate_id)
+            elif processed_doc:
+                # Ya estaba en procesados: se completa quién aprobó y el resultado de BigCommerce
+                candidate_id = str(processed_doc["_id"])
+                update = {f"processedData.{k}": v for k, v in bc_data.items()}
+                if not processed_doc.get("approvedBy"):
+                    update["approvedBy"] = email
+                    update["processedData.approvedBy"] = email
+                else:
+                    update.pop("processedData.approvedBy")
+                processed_candidates_collection.update_one({"_id": processed_doc["_id"]}, {"$set": update})
+            else:
+                candidate_id = None
+            source_doc = candidate or processed_doc or {}
+            logger.info(f"[{chunk_id}] Aprobada {brand}/{mpn} ({stores_ok} tienda(s) OK, {stores_failed} con error): {url}")
 
             approvals.append({
                 "chunk_id": chunk_id, "candidate_id": candidate_id, "brand": brand, "mpn": mpn,
-                "image_url": url, "source": candidate.get("source"), "lote": candidate.get("lote"),
+                "image_url": url, "source": source_doc.get("source"), "lote": source_doc.get("lote"),
                 "email": email, "bc_stores_ok": stores_ok, "bc_stores_failed": stores_failed,
             })
             images_out.append({
