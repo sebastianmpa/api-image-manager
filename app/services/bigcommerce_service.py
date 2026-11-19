@@ -481,6 +481,7 @@ def process_bigcommerce_image_update(
     processed_image_url: str,
     task_id: str,
     is_diagram: bool = False,
+    is_thumbnail: bool = True,
 ) -> Dict:
     """
     Orquesta el proceso completo:
@@ -495,6 +496,10 @@ def process_bigcommerce_image_update(
     :param task_id: ID de tarea (para logging)
     :param is_diagram: Si es True, el custom field __IMG queda en "DGR" (diagrama)
                         en vez de "NWM" (imagen normal)
+    :param is_thumbnail: True = la imagen queda como PRINCIPAL del producto (is_thumbnail de
+                        BigCommerce, la que sale en listados; solo puede haber una y BigCommerce
+                        le quita la marca a la anterior) y va primera en la galería (sort_order 0).
+                        False = se agrega como imagen secundaria, al final de la galería.
     :return: Resumen de resultados
     """
     img_field_value = "DGR" if is_diagram else "NWM"
@@ -587,15 +592,19 @@ def process_bigcommerce_image_update(
             # 6. Subir la imagen procesada nueva (description = PRODUCTNAME del producto)
             product_name = product.get("PRODUCTNAME", f"{brand} {sku}")
             logger.info(f"[{task_id}] Subiendo nueva imagen: {processed_image_url}")
+            # Principal → primera en la galería; secundaria → después de las que quedan
+            remaining = [img for img in existing_images if img.get("id") not in store_result["deleted_images"]]
+            sort_order = 0 if is_thumbnail else max([img.get("sort_order") or 0 for img in remaining] + [0]) + 1
+            store_result["is_thumbnail"] = is_thumbnail
             success, result = upload_product_image(
                 bc_product_id,
                 processed_image_url,
                 access_token,
                 store_hash,
                 client_id,
-                is_thumbnail=True,
+                is_thumbnail=is_thumbnail,
                 description=product_name,
-                sort_order=0,
+                sort_order=sort_order,
             )
 
             if success:

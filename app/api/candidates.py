@@ -27,6 +27,7 @@ from app.services.spaces_service import (
 from app.services.image_service import optimize_image_from_url, optimize_image_from_bytes
 from app.services.mongo_service import get_candidates_grouped_paginated, collection, soft_delete_candidate, get_deletion_stats, get_deletion_stats_by_email, save_failed_image, get_failed_images, update_failed_image_status, move_candidate_to_processed, get_processed_candidates, get_global_stats, add_manual_processed_candidate, get_not_found_candidates_paginated, resolve_not_found_candidates
 from app.services.mongo_service import add_warehouse_candidate, WAREHOUSE_LOTE, processed_candidates_collection
+from app.services.mongo_service import mark_sku_reviewed_no_image, get_reviewed_no_image
 import logging
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class ImageResult(BaseModel):
     brand: str = Field(..., min_length=1, description="Marca del producto")
     mpn: str = Field(..., min_length=1, description="Código MPN del producto")
     imageUrls: List[str] = Field(..., min_items=1, description="Lista de URLs de imágenes")
+    isThumbnail: Optional[List[bool]] = Field(None, description="Solo /approve-images (opcional): un valor por cada URL de imageUrls, en el mismo orden. true = esa imagen queda como PRINCIPAL del producto en BigCommerce (is_thumbnail); máximo una en true. Si no se envía, todas se suben como principal (comportamiento anterior)")
     
     @validator('brand')
     def brand_not_empty(cls, v):
@@ -379,6 +381,20 @@ def approve_images(
         brand, mpn = result.brand, result.mpn
         images_out = []
 
+        thumbs = result.isThumbnail
+        thumb_error = None
+        if thumbs is not None and len(thumbs) != len(result.imageUrls):
+            thumb_error = f"isThumbnail debe tener un valor por cada URL: {len(result.imageUrls)} URL(s) pero {len(thumbs)} valor(es)"
+        elif thumbs is not None and sum(thumbs) > 1:
+            thumb_error = "Solo una imagen puede ser la principal (isThumbnail=true) por producto"
+        if thumb_error:
+            results_out.append({
+                "brand": brand, "mpn": mpn, "ok": False, "error": thumb_error,
+                "images": [{"imageUrl": url, "ok": False, "error": thumb_error} for url in result.imageUrls],
+            })
+            continue
+        thumb_by_url = dict(zip(result.imageUrls, thumbs)) if thumbs is not None else {}
+
         if not search_products_by_brand_and_sku(brand, mpn):
             results_out.append({
                 "brand": brand, "mpn": mpn, "ok": False,
@@ -409,6 +425,7 @@ def approve_images(
                 summary = process_bigcommerce_image_update(
                     brand=brand, sku=mpn, processed_image_url=url, task_id=task_id,
                     is_diagram=bool((candidate or processed_doc or {}).get("isDiagram")),
+                    is_thumbnail=thumb_by_url.get(url, True),
                 )
             except Exception as e:
                 images_out.append({"imageUrl": url, "ok": False, "error": f"Error subiendo a BigCommerce: {e}"})
@@ -458,7 +475,8 @@ def approve_images(
             })
             images_out.append({
                 "imageUrl": url, "ok": True, "candidateId": candidate_id, "movedCandidateIds": moved_ids,
-                "bigcommerce": {"storesOk": stores_ok, "storesFailed": stores_failed, "taskId": task_id},
+                "bigcommerce": {"storesOk": stores_ok, "storesFailed": stores_failed, "taskId": task_id,
+                                "isThumbnail": thumb_by_url.get(url, True)},
             })
 
         results_out.append({"brand": brand, "mpn": mpn,
@@ -497,7 +515,8 @@ async def upload_product_image_endpoint(
     mpn: str = Form(..., description="Código MPN/SKU del producto"),
     email: str = Form(..., description="Email del usuario que sube la(s) imagen(es)"),
     files: List[UploadFile] = File(..., description="Una o más imágenes a subir"),
-    is_diagram: List[bool] = Form(..., description="Un valor por cada imagen en 'files', emparejado por posición (el N-ésimo is_diagram corresponde al N-ésimo file): True si esa imagen es un diagrama, False si es una foto de producto normal")
+    is_diagram: List[bool] = Form(..., description="Un valor por cada imagen en 'files', emparejado por posición (el N-ésimo is_diagram corresponde al N-ésimo file): True si esa imagen es un diagrama, False si es una foto de producto normal"),
+    is_thumbnail: Optional[List[bool]] = Form(None, description="Opcional. Un valor por cada imagen en 'files', emparejado por posición igual que is_diagram: True = esa imagen queda como PRINCIPAL del producto en BigCommerce (is_thumbnail); máximo una en True. Si no se envía, todas se suben como principal (comportamiento anterior)")
 ):
     """
     Sube una o varias imágenes de producto ya aprobadas. Por cada imagen:
@@ -512,6 +531,10 @@ async def upload_product_image_endpoint(
 
     `is_diagram` debe tener exactamente la misma cantidad de valores que `files`,
     en el mismo orden (posición 0 de is_diagram ↔ posición 0 de files, etc.).
+
+    `is_thumbnail` (opcional) va igual, un valor por archivo: true = esa imagen queda como
+    PRINCIPAL del producto en BigCommerce. Máximo una en true. Si no se envía, todas se
+    suben como principal (comportamiento anterior).
 
     Al terminar el lote, si hay registros en 'image_candidates_not_found' para ese
     brand+mpn (búsquedas previas sin resultado), se eliminan de ahí y se trasladan a
@@ -537,6 +560,16 @@ async def upload_product_image_endpoint(
             detail=f"Debe enviar un valor de is_diagram por cada archivo: {len(files)} archivo(s) pero {len(is_diagram)} valor(es) de is_diagram"
         )
 
+    if is_thumbnail is not None:
+        if len(is_thumbnail) != len(files):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Debe enviar un valor de is_thumbnail por cada archivo: {len(files)} archivo(s) pero {len(is_thumbnail)} valor(es) de is_thumbnail"
+            )
+        if sum(is_thumbnail) > 1:
+            raise HTTPException(status_code=400, detail="Solo una imagen puede ser la principal (is_thumbnail=true) por producto")
+    thumbnail_flags = is_thumbnail if is_thumbnail is not None else [True] * len(files)
+
     # Validar antes de subir nada: si el producto no está en el catálogo, la imagen
     # quedaría aprobada y contada como subida manual pero nunca llegaría a BigCommerce.
     if not search_products_by_brand_and_sku(brand, mpn):
@@ -551,7 +584,7 @@ async def upload_product_image_endpoint(
     created = []
     failed = []
 
-    for idx, (file, diagram_flag) in enumerate(zip(files, is_diagram)):
+    for idx, (file, diagram_flag, thumbnail_flag) in enumerate(zip(files, is_diagram, thumbnail_flags)):
         try:
             contents = await file.read()
             optimized_image_bytes = optimize_image_from_bytes(contents)
@@ -571,7 +604,8 @@ async def upload_product_image_endpoint(
                 processed_image_url=image_url,
                 original_image_url=image_url,
                 task_id=bc_task_id,
-                is_diagram=diagram_flag
+                is_diagram=diagram_flag,
+                is_thumbnail=thumbnail_flag,
             )
 
             created.append({
@@ -579,6 +613,7 @@ async def upload_product_image_endpoint(
                 "imageUrl": image_url,
                 "originalFilename": file.filename,
                 "isDiagram": diagram_flag,
+                "isThumbnail": thumbnail_flag,
                 "isPrimaryManual": candidate.get("isPrimaryManual"),
                 "bigcommerceTaskId": bc_task_id
             })
@@ -779,6 +814,71 @@ async def list_images_endpoint(
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listando imágenes: {str(e)}")
+
+
+class MarkNoImageRequest(BaseModel):
+    brand: str = Field(..., min_length=1, description="Marca del producto (tal como aparece en el listado)")
+    mpn: str = Field(..., min_length=1, description="MPN/SKU del producto (tal como aparece en el listado)")
+    email: str = Field(..., min_length=1, description="Email de quien lo revisó")
+    notes: Optional[str] = Field(None, description="Comentario opcional (ej. 'el fabricante no tiene foto')")
+
+
+@router.post("/mark-no-image", summary="Marcar SKU como revisado sin imagen (sale del listado y queda guardado)")
+def mark_no_image(request: MarkNoImageRequest, background_tasks: BackgroundTasks):
+    """
+    Para cuando no se consiguió imagen para un SKU ni con el programa ni manualmente.
+
+    1. Guarda el SKU en la colección `reviewed_no_image` con quién lo revisó, cuándo, las notas
+       y una copia de los candidatos y registros "sin resultado" que tenía.
+    2. Saca esos candidatos de `image_candidates` y de `image_candidates_not_found`.
+    3. Desde ese momento el SKU no vuelve a aparecer en `GET /candidates/all`, aunque el programa
+       le encuentre candidatos nuevos más adelante.
+
+    Si el SKU ya estaba marcado, se actualiza (queda el último que lo marcó) y se agrega al historial.
+    Se consulta con `GET /candidates/no-image`.
+    """
+    brand, mpn, email = request.brand.strip(), request.mpn.strip(), request.email.strip()
+    if not (brand and mpn and email):
+        raise HTTPException(status_code=400, detail="brand, mpn y email no pueden estar vacíos")
+    notes = (request.notes or "").strip() or None
+
+    try:
+        record, candidates_removed, not_found_removed = mark_sku_reviewed_no_image(brand, mpn, email, notes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error marcando el SKU: {e}")
+
+    background_tasks.add_task(save_stats_snapshot, "mark_no_image", email=email, brand=brand, mpn=mpn)
+    return {
+        "ok": True,
+        "brand": brand,
+        "mpn": mpn,
+        "reviewedBy": email,
+        "reviewedAt": record["reviewedAt"].isoformat(),
+        "notes": notes,
+        "candidatesRemoved": candidates_removed,
+        "notFoundRemoved": not_found_removed,
+        "timesReviewed": len(record.get("history", [])),
+    }
+
+
+@router.get("/no-image", summary="Listar SKUs revisados sin imagen")
+def list_no_image(
+    page: int = Query(1, ge=1, description="Número de página"),
+    limit: int = Query(20, ge=1, le=100, description="Resultados por página"),
+    brand: Optional[str] = Query(None, description="Filtrar por marca"),
+    mpn: Optional[str] = Query(None, description="Filtrar por MPN"),
+    email: Optional[str] = Query(None, description="Filtrar por quien lo revisó"),
+    date_from: Optional[str] = Query(None, description="Fecha inicio de revisión (ISO 8601, ej. 2026-11-01)"),
+    date_to: Optional[str] = Query(None, description="Fecha fin de revisión (ISO 8601, ej. 2026-11-30)"),
+):
+    """Lista los SKUs marcados con `POST /candidates/mark-no-image`, los más recientes primero."""
+    try:
+        return get_reviewed_no_image(page=page, limit=limit, brand=brand, mpn=mpn, email=email,
+                                     date_from=date_from, date_to=date_to)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Fecha inválida: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==================== ENDPOINTS DE CANDIDATOS ====================

@@ -3,10 +3,9 @@ Router para integraciones con BigCommerce.
 Incluye endpoints para upload de imágenes.
 """
 
-from fastapi import APIRouter, HTTPException, Header, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field, validator
 from typing import Optional
-from app.config import BIGCOMMERCE_API_KEY
 from app.services.bigcommerce_service import process_bigcommerce_image_update
 import logging
 
@@ -22,6 +21,8 @@ class BigCommerceImageUploadRequest(BaseModel):
     sku: str = Field(..., min_length=1, description="SKU del producto")
     processed_image_url: str = Field(..., description="URL de la imagen procesada")
     original_image_url: str = Field(..., description="URL de la imagen original")
+    is_diagram: bool = Field(False, description="True si la imagen es un diagrama (__IMG = DGR); False = foto (__IMG = NWM)")
+    is_thumbnail: bool = Field(True, description="True = imagen PRINCIPAL del producto en BigCommerce (is_thumbnail); False = imagen secundaria de la galería")
     
     @validator('brand')
     def brand_not_empty(cls, v):
@@ -59,7 +60,7 @@ class BigCommerceUploadResponse(BaseModel):
 
 # ==================== FUNCIONES DE BACKGROUND ====================
 
-async def process_bigcommerce_upload(brand: str, sku: str, processed_image_url: str, original_image_url: str, task_id: str, is_diagram: bool = False):
+async def process_bigcommerce_upload(brand: str, sku: str, processed_image_url: str, original_image_url: str, task_id: str, is_diagram: bool = False, is_thumbnail: bool = True):
     """
     Procesa el upload de imagen a BigCommerce en segundo plano.
 
@@ -71,13 +72,14 @@ async def process_bigcommerce_upload(brand: str, sku: str, processed_image_url: 
       5. Marcar custom field __IMG = "DGR" si es_diagram, o "NWM" si no
     """
     try:
-        logger.info(f"[{task_id}] Tarea recibida: brand={brand}, sku={sku}, is_diagram={is_diagram}")
+        logger.info(f"[{task_id}] Tarea recibida: brand={brand}, sku={sku}, is_diagram={is_diagram}, is_thumbnail={is_thumbnail}")
         result = process_bigcommerce_image_update(
             brand=brand,
             sku=sku,
             processed_image_url=processed_image_url,
             task_id=task_id,
             is_diagram=is_diagram,
+            is_thumbnail=is_thumbnail,
         )
         logger.info(
             f"[{task_id}] Tarea completada: "
@@ -94,20 +96,21 @@ async def process_bigcommerce_upload(brand: str, sku: str, processed_image_url: 
 @router.post("/upload-image", summary="Upload de imagen a BigCommerce", response_model=BigCommerceUploadResponse)
 async def upload_image_to_bigcommerce(
     request: BigCommerceImageUploadRequest,
-    background_tasks: BackgroundTasks,
-    x_api_key: str = Header(None, description="API Key para BigCommerce")
+    background_tasks: BackgroundTasks
 ):
     """
     Upload de imagen a BigCommerce.
     
     **Headers:**
-    - `x-api-key`: API Key para autorización
+    - `x-api-key`: API Key (WAREHOUSE_API_KEY)
     
     **Payload:**
     - `brand`: Marca del producto
     - `sku`: SKU del producto
     - `processed_image_url`: URL de la imagen procesada (PNG 2000x2000)
     - `original_image_url`: URL de la imagen original
+    - `is_diagram` (opcional, default false): true si es un diagrama
+    - `is_thumbnail` (opcional, default true): true = imagen principal del producto; false = secundaria
     
     **Respuesta:**
     - `200 OK`: Tarea iniciada en segundo plano
@@ -120,7 +123,7 @@ async def upload_image_to_bigcommerce(
     **Ejemplo:**
     ```bash
     curl -X 'POST' 'http://localhost:3600/bigcommerce/upload-image' \\
-      -H 'x-api-key: test-api-key-12345' \\
+      -H 'x-api-key: <API_KEY>' \\
       -H 'Content-Type: application/json' \\
       -d '{
         "brand": "Canon",
@@ -131,21 +134,8 @@ async def upload_image_to_bigcommerce(
     ```
     """
     
-    # ===== VALIDAR API KEY =====
-    if not x_api_key:
-        logger.warning("❌ Intento de upload sin x-api-key")
-        raise HTTPException(
-            status_code=401,
-            detail="x-api-key header requerido"
-        )
-    
-    if x_api_key != BIGCOMMERCE_API_KEY:
-        logger.warning(f"❌ Intento de upload con x-api-key inválida")
-        raise HTTPException(
-            status_code=403,
-            detail="x-api-key inválida o no autorizada"
-        )
-    
+    # La API key (x-api-key = WAREHOUSE_API_KEY) se valida para todos los endpoints en app/security.py
+
     # ===== GENERAR TASK ID =====
     import uuid
     import time
@@ -158,7 +148,9 @@ async def upload_image_to_bigcommerce(
         sku=request.sku,
         processed_image_url=request.processed_image_url,
         original_image_url=request.original_image_url,
-        task_id=task_id
+        task_id=task_id,
+        is_diagram=request.is_diagram,
+        is_thumbnail=request.is_thumbnail,
     )
     
     logger.info(f"✓ Tarea iniciada: {task_id} ({request.brand}/{request.sku})")

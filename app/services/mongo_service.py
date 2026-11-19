@@ -23,6 +23,8 @@ deletion_stats_collection = db["deletion_stats"]
 failed_images_collection = db["failed_images"]
 processed_candidates_collection = db["processed_candidates"]
 not_found_candidates_collection = db["image_candidates_not_found"]
+# SKUs (brand+mpn) revisados sin imagen: ni el programa ni la búsqueda manual consiguieron imagen
+reviewed_no_image_collection = db["reviewed_no_image"]
 
 
 def soft_delete_candidate(candidate_id: str, email: str):
@@ -344,6 +346,7 @@ def get_candidates_grouped_paginated(page: int = 1, limit: int = 20, brand: str 
         filters["mpn"] = mpn
     if lote:
         filters["lote"] = lote
+    filters.update(reviewed_no_image_exclusion())
 
     skip = (page - 1) * limit
     cursor = collection.find(filters).sort("createdAt", -1).skip(skip).limit(limit)
@@ -411,6 +414,7 @@ def get_not_found_candidates_paginated(page: int = 1, limit: int = 20, brand: st
         filters["mpn"] = mpn
     if lote:
         filters["lote"] = lote
+    filters.update(reviewed_no_image_exclusion())
 
     skip = (page - 1) * limit
     cursor = not_found_candidates_collection.find(filters).sort("createdAt", -1).skip(skip).limit(limit)
@@ -724,4 +728,107 @@ def get_global_stats():
         "warehousePending":  warehouse_pending,
         "warehouseApproved": warehouse_approved,
         "warehouseRejected": warehouse_rejected,
+    }
+
+
+def reviewed_no_image_exclusion() -> dict:
+    """
+    Filtro de Mongo para ocultar de los listados los SKUs marcados como revisados sin imagen
+    (aunque el programa vuelva a agregar candidatos de ese brand+mpn más adelante).
+    """
+    pairs = [{"brand": d["brand"], "mpn": d["mpn"]}
+             for d in reviewed_no_image_collection.find({}, {"brand": 1, "mpn": 1})]
+    return {"$nor": pairs} if pairs else {}
+
+
+def mark_sku_reviewed_no_image(brand: str, mpn: str, email: str, notes: str = None):
+    """
+    Marca un SKU (brand+mpn) como revisado sin imagen.
+
+    1. Guarda (o actualiza) un registro en `reviewed_no_image` con quién lo marcó, cuándo,
+       las notas, y una copia de los candidatos pendientes y de los registros "not found"
+       que tenía ese SKU (para poder revisarlos más adelante).
+    2. Saca esos candidatos de `image_candidates` y esos registros de
+       `image_candidates_not_found`, para que el SKU deje de aparecer en el listado.
+
+    Si el SKU ya estaba marcado, se actualiza y se agrega una entrada al historial.
+    Retorna el registro guardado.
+    """
+    from datetime import datetime
+
+    now = datetime.utcnow()
+    query = {"brand": brand, "mpn": mpn}
+    pending = list(collection.find(query))
+    not_found = list(not_found_candidates_collection.find(query))
+
+    for doc in pending + not_found:
+        doc["originalId"] = doc.pop("_id")
+
+    reviewed_no_image_collection.update_one(
+        query,
+        {
+            "$set": {"status": "reviewed_no_image", "reviewedBy": email, "reviewedAt": now, "notes": notes},
+            "$setOnInsert": {"brand": brand, "mpn": mpn, "createdAt": now},
+            "$push": {
+                "history": {"email": email, "at": now, "notes": notes,
+                            "candidatesRemoved": len(pending), "notFoundRemoved": len(not_found)},
+                "candidates": {"$each": pending},
+                "notFoundRecords": {"$each": not_found},
+            },
+        },
+        upsert=True,
+    )
+
+    if pending:
+        collection.delete_many({"_id": {"$in": [d["originalId"] for d in pending]}})
+    if not_found:
+        not_found_candidates_collection.delete_many({"_id": {"$in": [d["originalId"] for d in not_found]}})
+
+    return reviewed_no_image_collection.find_one(query), len(pending), len(not_found)
+
+
+def get_reviewed_no_image(page: int = 1, limit: int = 20, brand: str = None, mpn: str = None,
+                          email: str = None, date_from: str = None, date_to: str = None):
+    """Lista los SKUs revisados sin imagen (más recientes primero), con paginación y filtros."""
+    from bson import ObjectId
+    from datetime import datetime
+
+    filters = {}
+    if brand:
+        filters["brand"] = brand
+    if mpn:
+        filters["mpn"] = mpn
+    if email:
+        filters["reviewedBy"] = email
+    date_filter = {}
+    if date_from:
+        date_filter["$gte"] = datetime.fromisoformat(date_from)
+    if date_to:
+        end = datetime.fromisoformat(date_to)
+        if len(date_to) == 10:
+            end = end.replace(hour=23, minute=59, second=59)
+        date_filter["$lte"] = end
+    if date_filter:
+        filters["reviewedAt"] = date_filter
+
+    def convert_obj(obj):
+        if isinstance(obj, ObjectId):
+            return str(obj)
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, dict):
+            return {k: convert_obj(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [convert_obj(i) for i in obj]
+        return obj
+
+    skip = (page - 1) * limit
+    cursor = reviewed_no_image_collection.find(filters).sort("reviewedAt", -1).skip(skip).limit(limit)
+    results = [convert_obj(doc) for doc in cursor]
+    total_count = reviewed_no_image_collection.count_documents(filters)
+
+    return {
+        "results": results,
+        "stats": {"total": total_count, "page": page, "limit": limit,
+                  "total_pages": (total_count + limit - 1) // limit},
     }

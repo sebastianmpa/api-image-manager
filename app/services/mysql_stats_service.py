@@ -96,6 +96,7 @@ EVENT_LABELS = {
     "manual_sync":         "Sincronización manual",
     "warehouse_upload":    "Fotos subidas por Warehouse",
     "approve_images":      "Aprobación automática (bot) y subida a BigCommerce",
+    "mark_no_image":       "SKU revisado sin imagen",
 }
 
 _event_label_sql = "CASE s.`event` " + " ".join(
