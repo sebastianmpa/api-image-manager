@@ -540,6 +540,10 @@ def add_manual_processed_candidate(brand: str, mpn: str, image_url: str, email: 
     return processed_candidate
 
 
+# processedMethod de los registros 'not found' resueltos por una subida manual (no son imágenes)
+RESOLVED_NOT_FOUND_METHOD = "manual_upload_resolved_not_found"
+
+
 def resolve_not_found_candidates(brand: str, mpn: str, images: list, email: str = None):
     """
     Cuando se sube manualmente una o más imágenes para brand+mpn, resuelve los
@@ -564,7 +568,7 @@ def resolve_not_found_candidates(brand: str, mpn: str, images: list, email: str 
         processed_doc = {k: v for k, v in doc.items() if k != "_id"}
         processed_doc["originalId"] = original_id
         processed_doc["processedAt"] = datetime.utcnow()
-        processed_doc["processedMethod"] = "manual_upload_resolved_not_found"
+        processed_doc["processedMethod"] = RESOLVED_NOT_FOUND_METHOD
         processed_doc["processedData"] = {
             "brand": brand,
             "mpn": mpn,
@@ -665,19 +669,26 @@ def get_global_stats():
     automáticamente (revisión humana tipo "images-update") viven en el backend de task-hub,
     no en esta base de datos, así que no se incluyen acá.
     """
+    # Los registros 'not found' que se resuelven con una subida manual también se trasladan a
+    # processed_candidates (processedMethod=manual_upload_resolved_not_found, source=manual_upload),
+    # pero NO son imágenes: la imagen ya está contada en su propio documento de manual_upload.
+    # Si se contaran, cada SKU resuelto sumaría una imagen de más.
+    not_resolved = {"processedMethod": {"$ne": RESOLVED_NOT_FOUND_METHOD}}
+
     pending            = collection.count_documents({})
-    processed          = processed_candidates_collection.count_documents({})
+    processed          = processed_candidates_collection.count_documents(not_resolved)
     deleted            = deleted_candidates_collection.count_documents({})
     not_found          = not_found_candidates_collection.count_documents({})
     failed_images      = failed_images_collection.count_documents({})
     # Candidatos únicos con al menos una imagen fallida (por brand+mpn)
     failed_candidates  = len(failed_images_collection.distinct("mpn"))
 
-    manual_uploads = processed_candidates_collection.count_documents({"source": "manual_upload"})
-    diagrams       = processed_candidates_collection.count_documents({"isDiagram": True})
+    manual_uploads = processed_candidates_collection.count_documents({"source": "manual_upload", **not_resolved})
+    diagrams       = processed_candidates_collection.count_documents({"isDiagram": True, **not_resolved})
     images         = processed - diagrams
 
     sku_groups = list(processed_candidates_collection.aggregate([
+        {"$match": not_resolved},
         {"$group": {"_id": {"brand": "$brand", "mpn": "$mpn"}, "count": {"$sum": 1}}}
     ]))
     unique_skus = len(sku_groups)
@@ -694,10 +705,11 @@ def get_global_stats():
     user_rejected_candidates = deleted - warehouse_rejected
     bot_found_candidates = (pending - warehouse_pending) + user_approved_candidates + user_rejected_candidates
 
-    manual_images_primary     = processed_candidates_collection.count_documents({"source": "manual_upload", "isDiagram": False, "isPrimaryManual": True})
-    manual_images_secondary   = processed_candidates_collection.count_documents({"source": "manual_upload", "isDiagram": False, "isPrimaryManual": False})
-    manual_diagrams_primary   = processed_candidates_collection.count_documents({"source": "manual_upload", "isDiagram": True, "isPrimaryManual": True})
-    manual_diagrams_secondary = processed_candidates_collection.count_documents({"source": "manual_upload", "isDiagram": True, "isPrimaryManual": False})
+    manual = {"source": "manual_upload", **not_resolved}
+    manual_images_primary     = processed_candidates_collection.count_documents({**manual, "isDiagram": False, "isPrimaryManual": True})
+    manual_images_secondary   = processed_candidates_collection.count_documents({**manual, "isDiagram": False, "isPrimaryManual": False})
+    manual_diagrams_primary   = processed_candidates_collection.count_documents({**manual, "isDiagram": True, "isPrimaryManual": True})
+    manual_diagrams_secondary = processed_candidates_collection.count_documents({**manual, "isDiagram": True, "isPrimaryManual": False})
 
     return {
         "pending":          pending,

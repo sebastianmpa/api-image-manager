@@ -62,7 +62,9 @@ def load_docs():
 
 def stats_at(docs, t):
     """Replica get_global_stats() tal como habría dado en el instante t (UTC naive)."""
-    processed_docs = [d for d in docs["processed"] if d["processedAt"] <= t]
+    # Los not found resueltos por subida manual no son imágenes (igual que en get_global_stats)
+    processed_docs = [d for d in docs["processed"]
+                      if d["processedAt"] <= t and d.get("processedMethod") != RESOLVED_NOT_FOUND_METHOD]
     deleted_docs = [d for d in docs["deleted"] if d["deletedAt"] <= t]
     failed_docs = [d for d in docs["failed"] if d["failedAt"] <= t]
 
