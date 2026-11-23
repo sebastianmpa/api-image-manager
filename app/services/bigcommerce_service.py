@@ -6,6 +6,7 @@ Flujo: Buscar producto en MongoDB → obtener credenciales MySQL → gestionar i
 import logging
 import os
 import atexit
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Tuple
 
 import requests
@@ -17,6 +18,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# Sesión HTTP compartida para la API de BigCommerce: abrir una conexión nueva cuesta ~6 s desde
+# el servidor (medido: 6 s por llamada sin sesión vs 0.09 s reusando la conexión).
+_http = requests.Session()
+_http.mount("https://", requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20))
 
 # ==================== MONGO CLIENT (REUTILIZABLE) ====================
 
@@ -127,6 +133,17 @@ def _normalize_brand(brand: str) -> List[str]:
 
 # ==================== BÚSQUEDA EN MONGODB ====================
 
+_store_ids_cache = {"ids": None, "at": 0.0}
+
+
+def _get_store_ids(collection) -> list:
+    """STOREIDs de Products (distinct por índice, ~40 ms), cacheados 1 hora."""
+    import time
+    if _store_ids_cache["ids"] is None or time.time() - _store_ids_cache["at"] > 3600:
+        _store_ids_cache["ids"] = [s for s in collection.distinct("STOREID") if s is not None]
+        _store_ids_cache["at"] = time.time()
+    return _store_ids_cache["ids"]
+
 def search_products_by_brand_and_sku(brand: str, sku: str) -> List[Dict]:
     """
     Busca productos en la colección Products de MongoDB por BRAND y SKU/MPN.
@@ -147,10 +164,14 @@ def search_products_by_brand_and_sku(brand: str, sku: str) -> List[Dict]:
         brand_variants = _normalize_brand(brand)
         logger.debug(f"Buscando brand={brand_variants}, sku/mpn={sku}")
 
-        search_filter = {
-            "BRAND": {"$in": brand_variants},
-            "$or": [{"SKU": sku}, {"MPN": sku}],
-        }
+        # Todos los índices útiles de Products empiezan por STOREID (STOREID+BRAND+MPN, STOREID+SKU).
+        # Sin STOREID en el filtro Mongo usa el índice BRAND_1 y recorre todos los productos de la
+        # marca (≈80 s para TORO), el socketTimeout de 5 s corta y parecía que el producto no existía.
+        store_ids = _get_store_ids(collection)
+        search_filter = {"$or": [
+            {"STOREID": {"$in": store_ids}, "BRAND": {"$in": brand_variants}, "MPN": sku},
+            {"STOREID": {"$in": store_ids}, "SKU": sku, "BRAND": {"$in": brand_variants}},
+        ]}
 
         products = list(collection.find(search_filter))
 
@@ -164,13 +185,13 @@ def search_products_by_brand_and_sku(brand: str, sku: str) -> List[Dict]:
         else:
             logger.warning(f"Sin resultados para brand={brand}, sku={sku}")
 
-            # Debug: buscar solo por marca o solo por sku para diagnóstico
-            brand_sample = list(collection.find({"BRAND": brand_variants[0]}).limit(2))
-            sku_sample = list(collection.find({"$or": [{"SKU": sku}, {"MPN": sku}]}).limit(2))
-            if brand_sample:
-                logger.debug(f"  Productos con esa BRAND: {[p.get('SKU') for p in brand_sample]}")
+            # Diagnóstico: ¿existe ese SKU/MPN con otra marca? (también con STOREID para usar índice)
+            sku_sample = list(collection.find({"$or": [
+                {"STOREID": {"$in": store_ids}, "SKU": sku},
+                {"STOREID": {"$in": store_ids}, "MPN": sku},
+            ]}, {"BRAND": 1}).limit(5))
             if sku_sample:
-                logger.debug(f"  Productos con ese SKU/MPN: {[p.get('BRAND') for p in sku_sample]}")
+                logger.warning(f"  Ese SKU/MPN existe con otra(s) marca(s): {sorted({p.get('BRAND') for p in sku_sample})}")
 
         return products
 
@@ -246,7 +267,7 @@ def get_product_images(
     """
     url = f"https://api.bigcommerce.com/stores/{store_hash}/v3/catalog/products/{product_id}/images"
     try:
-        resp = requests.get(url, headers=_bc_headers(access_token, client_id), timeout=10)
+        resp = _http.get(url, headers=_bc_headers(access_token, client_id), timeout=10)
         if resp.status_code == 200:
             images = resp.json().get("data", [])
             logger.info(f"Producto {product_id}: {len(images)} imagen(es) actuales")
@@ -275,7 +296,7 @@ def delete_product_image(
     """
     url = f"https://api.bigcommerce.com/stores/{store_hash}/v3/catalog/products/{product_id}/images/{image_id}"
     try:
-        resp = requests.delete(url, headers=_bc_headers(access_token), timeout=10)
+        resp = _http.delete(url, headers=_bc_headers(access_token), timeout=10)
         if resp.status_code == 204:
             logger.info(f"  ✓ Imagen {image_id} eliminada del producto {product_id}")
             return True, f"Imagen {image_id} eliminada"
@@ -318,7 +339,7 @@ def upload_product_image(
         "sort_order": sort_order,
     }
     try:
-        resp = requests.post(
+        resp = _http.post(
             url,
             headers=_bc_headers(access_token, client_id),
             json=payload,
@@ -349,7 +370,7 @@ def _get_custom_fields(
     """Retorna todos los custom fields del producto."""
     url = f"https://api.bigcommerce.com/stores/{store_hash}/v3/catalog/products/{product_id}/custom-fields"
     try:
-        resp = requests.get(url, headers=_bc_headers(access_token, client_id), timeout=10)
+        resp = _http.get(url, headers=_bc_headers(access_token, client_id), timeout=10)
         if resp.status_code == 200:
             return resp.json().get("data", [])
         logger.warning(f"GET custom-fields status={resp.status_code} body={resp.text[:200]}")
@@ -370,7 +391,7 @@ def _create_custom_field(
     """Crea un nuevo custom field."""
     url = f"https://api.bigcommerce.com/stores/{store_hash}/v3/catalog/products/{product_id}/custom-fields"
     try:
-        resp = requests.post(
+        resp = _http.post(
             url,
             headers=_bc_headers(access_token, client_id),
             json={"name": name, "value": value},
@@ -399,7 +420,7 @@ def _update_custom_field(
     """Actualiza el valor de un custom field existente."""
     url = f"https://api.bigcommerce.com/stores/{store_hash}/v3/catalog/products/{product_id}/custom-fields/{field_id}"
     try:
-        resp = requests.put(
+        resp = _http.put(
             url,
             headers=_bc_headers(access_token, client_id),
             json={"value": value},
@@ -426,7 +447,7 @@ def _delete_custom_field(
     """Elimina un custom field por id."""
     url = f"https://api.bigcommerce.com/stores/{store_hash}/v3/catalog/products/{product_id}/custom-fields/{field_id}"
     try:
-        resp = requests.delete(url, headers=_bc_headers(access_token, client_id), timeout=10)
+        resp = _http.delete(url, headers=_bc_headers(access_token, client_id), timeout=10)
         return resp.status_code == 204
     except Exception as e:
         logger.error(f"Error eliminando custom field id={field_id}: {e}")
@@ -524,8 +545,9 @@ def process_bigcommerce_image_update(
 
     summary["products_found"] = len(products)
 
-    # 2. Procesar cada producto (puede estar en varias tiendas)
-    for product in products:
+    # 2. Procesar cada producto (puede estar en varias tiendas); las tiendas son independientes
+    # entre sí, así que se procesan en paralelo
+    def _update_store(product):
         bc_product_id = product.get("ID")
         store_id = product.get("STOREID")
 
@@ -533,7 +555,7 @@ def process_bigcommerce_image_update(
             msg = f"Producto sin ID o STOREID: {product.get('_id')}"
             logger.warning(f"[{task_id}] {msg}")
             summary["errors"].append(msg)
-            continue
+            return None
 
         store_result = {
             "store_id": store_id,
@@ -629,8 +651,16 @@ def process_bigcommerce_image_update(
         except ValueError as e:
             store_result["error"] = str(e)
             logger.error(f"[{task_id}] Error en store_id={store_id}: {e}")
+        except Exception as e:
+            store_result["error"] = str(e)
+            logger.error(f"[{task_id}] Error inesperado en store_id={store_id}: {e}", exc_info=True)
 
-        summary["stores_processed"].append(store_result)
+        return store_result
+
+    with ThreadPoolExecutor(max_workers=min(len(products), 8)) as pool:
+        for store_result in pool.map(_update_store, products):
+            if store_result is not None:
+                summary["stores_processed"].append(store_result)
 
     logger.info(
         f"[{task_id}] ── Finalizado: {len(summary['stores_processed'])} tienda(s) procesada(s), "

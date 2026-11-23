@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 from pymongo import MongoClient
 from dotenv import load_dotenv
 
@@ -283,13 +284,28 @@ def move_candidate_to_processed(brand: str, mpn: str, image_urls: list, processe
     return [str(c["_id"]) for c in candidates]
 
 
-def get_processed_candidates(page: int = 1, limit: int = 20, brand: str = None, mpn: str = None, lote: str = None, email: str = None, date_from: str = None, date_to: str = None):
+def _is_date_only(value: str) -> bool:
+    return len(value.strip()) <= 10
+
+
+def _local_date_to_utc(value: str):
+    """Fecha/hora del front (hora local del servidor, UTC-5) → UTC naive, como se guarda processedAt."""
+    from datetime import datetime
+    offset = datetime.now() - datetime.utcnow()
+    offset = timedelta(minutes=round(offset.total_seconds() / 60))
+    return datetime.fromisoformat(value.strip()) - offset
+
+
+def get_processed_candidates(page: int = 1, limit: int = 20, brand: str = None, mpn: str = None, lote: str = None, email: str = None, date_from: str = None, date_to: str = None, processed_method: str = None):
     """
     Obtiene los candidatos procesados (aprobados) con paginación.
+    processed_method (opcional) filtra por un método puntual, p. ej. "manual_upload".
     """
     from datetime import datetime
 
-    filters = {}
+    # Los registros 'not found' resueltos por una subida manual no son imágenes (no tienen imageUrl):
+    # la imagen ya aparece en su propio documento de manual_upload, así que se ocultan del listado.
+    filters = {"processedMethod": processed_method or {"$ne": RESOLVED_NOT_FOUND_METHOD}}
     if brand:
         filters["brand"] = brand
     if mpn:
@@ -301,12 +317,17 @@ def get_processed_candidates(page: int = 1, limit: int = 20, brand: str = None, 
     if date_from or date_to:
         filters["processedAt"] = {}
         if date_from:
-            filters["processedAt"]["$gte"] = datetime.fromisoformat(date_from)
+            filters["processedAt"]["$gte"] = _local_date_to_utc(date_from)
         if date_to:
-            filters["processedAt"]["$lte"] = datetime.fromisoformat(date_to)
+            if _is_date_only(date_to):
+                # "2026-11-23" = hasta el final de ese día (antes se cortaba a las 00:00)
+                filters["processedAt"]["$lt"] = _local_date_to_utc(date_to) + timedelta(days=1)
+            else:
+                filters["processedAt"]["$lte"] = _local_date_to_utc(date_to)
 
     skip = (page - 1) * limit
-    cursor = processed_candidates_collection.find(filters).sort("processedAt", -1).skip(skip).limit(limit)
+    # Más recientes primero; _id desempata las que tienen la misma hora (orden estable entre páginas)
+    cursor = processed_candidates_collection.find(filters).sort([("processedAt", -1), ("_id", -1)]).skip(skip).limit(limit)
     
     def convert_obj(obj):
         from bson import ObjectId

@@ -56,8 +56,13 @@ CREATE TABLE IF NOT EXISTS `{TABLE_NAME}` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
-# Aprobaciones automáticas que hace el bot con POST /candidates/approve-images (una fila por imagen aprobada).
+# Una fila por imagen aprobada y subida a BigCommerce, venga de donde venga:
+#   - bot con POST /candidates/approve-images (source = la del candidato: scraper, warehouse...)
+#   - subida manual con POST /candidates/upload-product-image (source = MANUAL_UPLOAD_SOURCE)
+#   - subida directa con POST /bigcommerce/upload-image (source = BIGCOMMERCE_UPLOAD_SOURCE)
 CANDIDATE_APPROVALS_TABLE = "image_candidate_approvals"
+MANUAL_UPLOAD_SOURCE = "manual_upload"
+BIGCOMMERCE_UPLOAD_SOURCE = "bigcommerce_upload"
 
 CREATE_CANDIDATE_APPROVALS_SQL = f"""
 CREATE TABLE IF NOT EXISTS `{CANDIDATE_APPROVALS_TABLE}` (
@@ -72,6 +77,8 @@ CREATE TABLE IF NOT EXISTS `{CANDIDATE_APPROVALS_TABLE}` (
   `email` varchar(100) DEFAULT NULL,
   `bc_stores_ok` int(11) NOT NULL DEFAULT 0,
   `bc_stores_failed` int(11) NOT NULL DEFAULT 0,
+  `is_diagram` tinyint(1) DEFAULT NULL,
+  `is_thumbnail` tinyint(1) DEFAULT NULL,
   `approved_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   KEY `idx_approved_at` (`approved_at`),
@@ -101,13 +108,22 @@ SELECT
   r.`email`,
   r.`reviewed_at`,
   DATE(IFNULL(r.`reviewed_at`, r.`created_at`)) AS `fecha`,
-  r.`created_at`
+  r.`created_at`,
+  NULL AS `es_diagrama`,
+  NULL AS `es_principal`,
+  NULL AS `bc_tiendas_ok`,
+  NULL AS `bc_tiendas_error`
 FROM `{TABLE_NAME}` r
 WHERE r.`deleted_at` IS NULL
 UNION ALL
 SELECT
   CONCAT('cand-', a.`id`),
-  CASE WHEN a.`source` = 'warehouse' THEN 'Aprobación automática (bot) - Warehouse' ELSE 'Aprobación automática (bot)' END,
+  CASE a.`source`
+    WHEN 'warehouse' THEN 'Aprobación automática (bot) - Warehouse'
+    WHEN '{MANUAL_UPLOAD_SOURCE}' THEN 'Subida manual'
+    WHEN '{BIGCOMMERCE_UPLOAD_SOURCE}' THEN 'Subida directa a BigCommerce'
+    ELSE 'Aprobación automática (bot)'
+  END,
   a.`chunk_id`,
   a.`brand`,
   a.`mpn`,
@@ -117,7 +133,11 @@ SELECT
   a.`email`,
   a.`approved_at`,
   DATE(a.`approved_at`),
-  a.`approved_at`
+  a.`approved_at`,
+  a.`is_diagram`,
+  a.`is_thumbnail`,
+  a.`bc_stores_ok`,
+  a.`bc_stores_failed`
 FROM `{CANDIDATE_APPROVALS_TABLE}` a
 """
 
@@ -198,20 +218,30 @@ def _ensure_table(cursor):
     if not _table_ready:
         cursor.execute(CREATE_TABLE_SQL)
         cursor.execute(CREATE_CANDIDATE_APPROVALS_SQL)
+        # Columnas agregadas después de crear la tabla (en producción ya existe sin ellas)
+        cursor.execute(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s",
+            (CANDIDATE_APPROVALS_TABLE,),
+        )
+        existing = {row[0] for row in cursor.fetchall()}
+        for col in ("is_diagram", "is_thumbnail"):
+            if col not in existing:
+                cursor.execute(f"ALTER TABLE `{CANDIDATE_APPROVALS_TABLE}` ADD COLUMN `{col}` tinyint(1) DEFAULT NULL AFTER `bc_stores_failed`")
         cursor.execute(REVIEWS_VIEW_SQL)
         _table_ready = True
 
 
 def save_candidate_approvals(rows: list) -> bool:
     """
-    Guarda en image_candidate_approvals las imágenes que el bot aprobó con /approve-images.
-    Cada fila es un dict con chunk_id, candidate_id, brand, mpn, image_url, source, lote,
-    email, bc_stores_ok y bc_stores_failed. Nunca lanza: si MySQL falla solo se loguea.
+    Guarda en image_candidate_approvals las imágenes aprobadas y subidas a BigCommerce
+    (bot, subida manual o subida directa). Cada fila es un dict con chunk_id, candidate_id,
+    brand, mpn, image_url, source, lote, email, bc_stores_ok, bc_stores_failed y
+    opcionalmente is_diagram / is_thumbnail. Nunca lanza: si MySQL falla solo se loguea.
     """
     if not rows:
         return True
     columns = ["chunk_id", "candidate_id", "brand", "mpn", "image_url", "source", "lote",
-               "email", "bc_stores_ok", "bc_stores_failed"]
+               "email", "bc_stores_ok", "bc_stores_failed", "is_diagram", "is_thumbnail"]
     connection = None
     try:
         connection = _get_connection()
@@ -233,6 +263,36 @@ def save_candidate_approvals(rows: list) -> bool:
         if connection and connection.is_connected():
             connection.close()
     return False
+
+
+def get_candidate_approval_results(candidate_ids: list) -> dict:
+    """
+    Último resultado de BigCommerce guardado para cada candidate_id:
+    {candidate_id: {bc_stores_ok, bc_stores_failed, is_thumbnail, approved_at, source}}.
+    Los que no aparecen todavía no tienen resultado (envío en curso o anterior al registro).
+    Nunca lanza: si MySQL falla devuelve {}.
+    """
+    ids = [str(c) for c in candidate_ids if c]
+    if not ids:
+        return {}
+    connection = None
+    try:
+        connection = _get_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            f"SELECT candidate_id, bc_stores_ok, bc_stores_failed, is_thumbnail, approved_at, source "
+            f"FROM `{CANDIDATE_APPROVALS_TABLE}` WHERE candidate_id IN ({', '.join(['%s'] * len(ids))}) "
+            f"ORDER BY id",
+            ids,
+        )
+        # ORDER BY id: si hay varias filas para el mismo candidato queda la más reciente
+        return {row["candidate_id"]: row for row in cursor.fetchall()}
+    except Exception as e:
+        logger.error(f"Error leyendo resultados de BigCommerce de candidatos: {e}")
+        return {}
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
 
 
 def sync_review_approvals() -> Optional[dict]:

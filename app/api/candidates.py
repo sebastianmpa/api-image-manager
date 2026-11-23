@@ -3,9 +3,13 @@ from fastapi import APIRouter, HTTPException, Query, status, File, UploadFile, F
 from fastapi.responses import StreamingResponse, JSONResponse
 from io import BytesIO
 from PIL import Image, ImageOps
+import asyncio
+import json
 import secrets
 import time
 import uuid
+from datetime import datetime
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, validator
 from bson import ObjectId
 from typing import Optional, List
@@ -32,9 +36,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 from app.services.mysql_stats_service import save_stats_snapshot
-from app.services.review_approvals_sync import sync_review_approvals, save_candidate_approvals
+from app.services.review_approvals_sync import sync_review_approvals, save_candidate_approvals, get_candidate_approval_results, MANUAL_UPLOAD_SOURCE
 from app.services.bigcommerce_service import search_products_by_brand_and_sku, process_bigcommerce_image_update
-from app.api.bigcommerce import process_bigcommerce_upload
+from app.api.bigcommerce import process_bigcommerce_upload, run_bigcommerce_upload, bigcommerce_status
 from app.config import WAREHOUSE_API_KEY
 
 router = APIRouter()
@@ -472,6 +476,7 @@ def approve_images(
                 "chunk_id": chunk_id, "candidate_id": candidate_id, "brand": brand, "mpn": mpn,
                 "image_url": url, "source": source_doc.get("source"), "lote": source_doc.get("lote"),
                 "email": email, "bc_stores_ok": stores_ok, "bc_stores_failed": stores_failed,
+                "is_diagram": int(bool(source_doc.get("isDiagram"))), "is_thumbnail": int(bool(thumb_by_url.get(url, True))),
             })
             images_out.append({
                 "imageUrl": url, "ok": True, "candidateId": candidate_id, "movedCandidateIds": moved_ids,
@@ -506,6 +511,44 @@ async def upload_image_to_spaces_endpoint(file: UploadFile = File(...)):
         return {"filename": filename, "url": url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error subiendo imagen: {str(e)}")
+
+
+def _validate_manual_upload(brand: str, mpn: str, email: str, files: list, is_diagram: list, is_thumbnail: Optional[list]):
+    """Validaciones comunes de /upload-product-image y /upload-product-image/stream.
+    Devuelve (brand, mpn, email, thumbnail_flags) normalizados o lanza HTTPException."""
+    brand = brand.strip()
+    mpn = mpn.strip()
+    email = email.strip()
+    if not brand or not mpn:
+        raise HTTPException(status_code=400, detail="brand y mpn no pueden estar vacíos")
+    if not email:
+        raise HTTPException(status_code=400, detail="email no puede estar vacío")
+    if not files:
+        raise HTTPException(status_code=400, detail="Debe enviar al menos un archivo")
+    if len(is_diagram) != len(files):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Debe enviar un valor de is_diagram por cada archivo: {len(files)} archivo(s) pero {len(is_diagram)} valor(es) de is_diagram"
+        )
+
+    if is_thumbnail is not None:
+        if len(is_thumbnail) != len(files):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Debe enviar un valor de is_thumbnail por cada archivo: {len(files)} archivo(s) pero {len(is_thumbnail)} valor(es) de is_thumbnail"
+            )
+        if sum(is_thumbnail) > 1:
+            raise HTTPException(status_code=400, detail="Solo una imagen puede ser la principal (is_thumbnail=true) por producto")
+    thumbnail_flags = is_thumbnail if is_thumbnail is not None else [True] * len(files)
+
+    # Validar antes de subir nada: si el producto no está en el catálogo, la imagen
+    # quedaría aprobada y contada como subida manual pero nunca llegaría a BigCommerce.
+    if not search_products_by_brand_and_sku(brand, mpn):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No existe un producto con brand={brand} y mpn/sku={mpn} en el catálogo. Revisa la marca y el código."
+        )
+    return brand, mpn, email, thumbnail_flags
 
 
 @router.post("/upload-product-image", summary="Subir una o varias imágenes de producto ya aprobadas, asociarlas a marca+mpn y enviarlas a BigCommerce")
@@ -545,41 +588,7 @@ async def upload_product_image_endpoint(
     respuesta; su resultado solo queda en logs (mismo comportamiento que
     POST /bigcommerce/upload-image).
     """
-    brand = brand.strip()
-    mpn = mpn.strip()
-    email = email.strip()
-    if not brand or not mpn:
-        raise HTTPException(status_code=400, detail="brand y mpn no pueden estar vacíos")
-    if not email:
-        raise HTTPException(status_code=400, detail="email no puede estar vacío")
-    if not files:
-        raise HTTPException(status_code=400, detail="Debe enviar al menos un archivo")
-    if len(is_diagram) != len(files):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Debe enviar un valor de is_diagram por cada archivo: {len(files)} archivo(s) pero {len(is_diagram)} valor(es) de is_diagram"
-        )
-
-    if is_thumbnail is not None:
-        if len(is_thumbnail) != len(files):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Debe enviar un valor de is_thumbnail por cada archivo: {len(files)} archivo(s) pero {len(is_thumbnail)} valor(es) de is_thumbnail"
-            )
-        if sum(is_thumbnail) > 1:
-            raise HTTPException(status_code=400, detail="Solo una imagen puede ser la principal (is_thumbnail=true) por producto")
-    thumbnail_flags = is_thumbnail if is_thumbnail is not None else [True] * len(files)
-
-    # Validar antes de subir nada: si el producto no está en el catálogo, la imagen
-    # quedaría aprobada y contada como subida manual pero nunca llegaría a BigCommerce.
-    if not search_products_by_brand_and_sku(brand, mpn):
-        raise HTTPException(
-            status_code=404,
-            detail=f"No existe un producto con brand={brand} y mpn/sku={mpn} en el catálogo. Revisa la marca y el código."
-        )
-
-    import time
-    import uuid
+    brand, mpn, email, thumbnail_flags = _validate_manual_upload(brand, mpn, email, files, is_diagram, is_thumbnail)
 
     created = []
     failed = []
@@ -606,6 +615,9 @@ async def upload_product_image_endpoint(
                 task_id=bc_task_id,
                 is_diagram=diagram_flag,
                 is_thumbnail=thumbnail_flag,
+                # Subida manual = imagen aprobada: queda en MySQL con el resultado de BigCommerce
+                approval={"source": MANUAL_UPLOAD_SOURCE, "email": email, "lote": candidate.get("lote"),
+                          "candidate_id": str(candidate["_id"])},
             )
 
             created.append({
@@ -642,6 +654,231 @@ async def upload_product_image_endpoint(
         "failed": failed,
         "resolvedNotFound": resolved_not_found
     }
+
+
+# ==================== SUBIDA MANUAL CON PROGRESO ====================
+
+# Progreso de las subidas con /upload-product-image/stream, en memoria (PM2 corre un solo
+# proceso de uvicorn). Se borran 1 h después de su última actualización.
+UPLOAD_PROGRESS_TTL_SECONDS = 3600
+MANUAL_UPLOAD_STEPS = ("optimizing", "uploading", "bigcommerce")
+_upload_progress: dict = {}
+
+
+def _prune_upload_progress():
+    cutoff = time.time() - UPLOAD_PROGRESS_TTL_SECONDS
+    for key in [k for k, job in _upload_progress.items() if job["status"] != "running" and job["_updated"] < cutoff]:
+        _upload_progress.pop(key, None)
+
+
+def _public_job(job: dict) -> dict:
+    return {k: v for k, v in job.items() if not k.startswith("_")}
+
+
+async def _run_manual_upload(job: dict, queue: asyncio.Queue, items: list, brand: str, mpn: str, email: str):
+    """
+    Procesa las imágenes una por una (optimizar → Spaces + Mongo → BigCommerce) y va
+    publicando eventos en `queue` y en `job` (para GET /upload-progress/{uploadId}).
+    Corre como tarea aparte: si el cliente cierra la conexión, la subida termina igual.
+    """
+    total = len(items)
+    steps_total = total * len(MANUAL_UPLOAD_STEPS)
+    state = {"steps_done": 0}
+    progress = job["progress"]
+
+    def advance(n: int = 1):
+        state["steps_done"] += n
+        progress["percent"] = min(100, int(100 * state["steps_done"] / steps_total))
+
+    def emit(event: str, **data):
+        job["_updated"] = time.time()
+        queue.put_nowait({"event": event, "uploadId": job["uploadId"], **data, "progress": dict(progress)})
+
+    def set_step(idx: int, step: str):
+        job["images"][idx]["status"] = step
+        emit("progress", index=idx, filename=job["images"][idx]["filename"], step=step)
+
+    created, failed = [], []
+    try:
+        emit("start", brand=brand, mpn=mpn, email=email, images=[{"index": i["index"], "filename": i["filename"]} for i in job["images"]])
+
+        async def send_to_bigcommerce(prev_task, idx, filename, image_url, candidate, diagram_flag, thumbnail_flag, timestamp):
+            # Los envíos a BigCommerce del mismo producto van en orden, uno tras otro (el primero
+            # puede borrar el logo del proveedor); mientras tanto ya se optimiza la imagen siguiente.
+            if prev_task is not None:
+                await prev_task
+            image = job["images"][idx]
+            set_step(idx, "bigcommerce")
+            t0 = time.time()
+            bc = await run_in_threadpool(
+                run_bigcommerce_upload, brand, mpn, image_url, f"bc-upload-{timestamp}-{uuid.uuid4().hex[:8]}",
+                diagram_flag, thumbnail_flag,
+                # Subida manual = imagen aprobada: queda en MySQL con el resultado de BigCommerce
+                {"source": MANUAL_UPLOAD_SOURCE, "email": email, "lote": candidate.get("lote"),
+                 "candidate_id": str(candidate["_id"])},
+            )
+            logger.info(f"[{job['uploadId']}] imagen {idx}: BigCommerce {time.time() - t0:.1f}s ({bc['status']})")
+            advance()
+            image.update({"status": "done", "bigcommerce": bc})
+            progress["uploaded"] += 1
+            created.append({
+                "candidateId": image["candidateId"],
+                "imageUrl": image_url,
+                "originalFilename": filename,
+                "isDiagram": diagram_flag,
+                "isThumbnail": thumbnail_flag,
+                "isPrimaryManual": image["isPrimaryManual"],
+                "bigcommerce": bc,
+            })
+            progress["processed"] += 1
+            emit("image_done", index=idx, **created[-1])
+
+        bc_task = None
+        for idx, (filename, contents, diagram_flag, thumbnail_flag) in enumerate(items):
+            image = job["images"][idx]
+            steps_before = state["steps_done"]
+            try:
+                set_step(idx, "optimizing")
+                t0 = time.time()
+                optimized = await run_in_threadpool(optimize_image_from_bytes, contents)
+                advance()
+
+                set_step(idx, "uploading")
+                t1 = time.time()
+                timestamp = int(time.time() * 1000)
+                image_url = await run_in_threadpool(upload_image_to_spaces, optimized, f"{brand}_{mpn}_{idx}_{timestamp}.jpg", "image/jpeg")
+                candidate = await run_in_threadpool(add_manual_processed_candidate, brand, mpn, image_url, email, diagram_flag)
+                image.update({"candidateId": str(candidate["_id"]), "imageUrl": image_url,
+                              "isPrimaryManual": candidate.get("isPrimaryManual")})
+                advance()
+                logger.info(f"[{job['uploadId']}] imagen {idx}: optimizar {t1 - t0:.1f}s, Spaces+Mongo {time.time() - t1:.1f}s")
+
+                bc_task = asyncio.create_task(send_to_bigcommerce(
+                    bc_task, idx, filename, image_url, candidate, diagram_flag, thumbnail_flag, timestamp))
+            except Exception as e:
+                logger.error(f"[{job['uploadId']}] Error subiendo {filename}: {e}", exc_info=True)
+                advance(len(MANUAL_UPLOAD_STEPS) - (state["steps_done"] - steps_before))
+                image.update({"status": "failed", "error": str(e)})
+                progress["failed"] += 1
+                progress["processed"] += 1
+                failed.append({"originalFilename": filename, "error": str(e)})
+                emit("image_failed", index=idx, filename=filename, error=str(e))
+
+        if bc_task is not None:
+            await bc_task  # espera toda la cadena de envíos a BigCommerce
+
+        resolved_not_found = []
+        if created:
+            resolved_not_found = await run_in_threadpool(
+                resolve_not_found_candidates, brand, mpn,
+                [{"imageUrl": c["imageUrl"], "isDiagram": c["isDiagram"]} for c in created], email,
+            )
+            try:
+                await run_in_threadpool(save_stats_snapshot, "manual_upload", email=email, brand=brand, mpn=mpn)
+            except Exception as e:
+                logger.error(f"[{job['uploadId']}] Error guardando snapshot de estadísticas: {e}")
+
+        job["result"] = {
+            "brand": brand, "mpn": mpn, "email": email,
+            "totalUploaded": len(created), "totalFailed": len(failed),
+            "candidates": created, "failed": failed, "resolvedNotFound": resolved_not_found,
+        }
+        job["status"] = "done"
+    except Exception as e:
+        logger.error(f"[{job['uploadId']}] Error inesperado en la subida: {e}", exc_info=True)
+        job["status"] = "error"
+        job["error"] = str(e)
+        job["result"] = {"brand": brand, "mpn": mpn, "email": email, "totalUploaded": len(created),
+                         "totalFailed": total - len(created), "candidates": created, "failed": failed,
+                         "resolvedNotFound": []}
+    progress["percent"] = 100
+    emit("done", status=job["status"], error=job.get("error"), **job["result"])
+
+
+@router.post("/upload-product-image/stream", summary="Subir varias imágenes de producto mostrando el progreso (respuesta NDJSON en vivo)")
+async def upload_product_image_stream(
+    brand: str = Form(..., description="Marca del producto"),
+    mpn: str = Form(..., description="Código MPN/SKU del producto"),
+    email: str = Form(..., description="Email del usuario que sube la(s) imagen(es)"),
+    files: List[UploadFile] = File(..., description="Una o más imágenes a subir"),
+    is_diagram: List[bool] = Form(..., description="Un valor por cada imagen en 'files', en el mismo orden"),
+    is_thumbnail: Optional[List[bool]] = Form(None, description="Opcional. Un valor por cada imagen; máximo una en True (imagen principal)"),
+    upload_id: Optional[str] = Form(None, description="Opcional. ID que genera el front para consultar GET /candidates/upload-progress/{upload_id} si su proxy no deja pasar el stream"),
+):
+    """
+    Mismos parámetros y mismo resultado que POST /candidates/upload-product-image, pero la
+    respuesta llega por partes mientras se procesa (Content-Type `application/x-ndjson`:
+    un JSON por línea). A diferencia del endpoint normal, el envío a BigCommerce se hace
+    aquí mismo, así que cada imagen termina con su resultado real por tienda.
+
+    **Eventos (campo `event`):**
+    - `start`: lista de imágenes recibidas (`images[].index`, `images[].filename`)
+    - `progress`: la imagen `index` entra al paso `step` = `optimizing` | `uploading` | `bigcommerce`
+    - `image_done`: imagen lista; trae `candidateId`, `imageUrl`, `isDiagram`, `isThumbnail` y
+      `bigcommerce` = {`status`: ok | partial | failed, `storesOk`, `storesFailed`, `errors`}
+    - `image_failed`: la imagen `index` falló (`error`); sigue con las demás
+    - `done`: último evento; trae el mismo resumen que el endpoint normal
+      (`totalUploaded`, `totalFailed`, `candidates`, `failed`, `resolvedNotFound`) y `status` = done | error
+
+    Todos los eventos traen `uploadId` y `progress` = {`total`, `processed`, `uploaded`, `failed`, `percent`}.
+
+    Los errores de validación (400/404/409) responden normal, antes de empezar el stream.
+    Si el cliente se desconecta, la subida sigue en el servidor; el estado se puede consultar
+    con GET /candidates/upload-progress/{uploadId} (se guarda 1 hora).
+    """
+    brand, mpn, email, thumbnail_flags = _validate_manual_upload(brand, mpn, email, files, is_diagram, is_thumbnail)
+
+    _prune_upload_progress()
+    upload_id = (upload_id or "").strip() or f"up-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    if upload_id in _upload_progress:
+        raise HTTPException(status_code=409, detail=f"Ya existe una subida con upload_id={upload_id}")
+
+    # Leer todo antes de responder: los UploadFile se cierran cuando termina el request
+    items = []
+    for file, diagram_flag, thumbnail_flag in zip(files, is_diagram, thumbnail_flags):
+        items.append((file.filename, await file.read(), diagram_flag, thumbnail_flag))
+
+    job = {
+        "uploadId": upload_id,
+        "brand": brand, "mpn": mpn, "email": email,
+        "status": "running",
+        "startedAt": datetime.utcnow().isoformat(),
+        "progress": {"total": len(items), "processed": 0, "uploaded": 0, "failed": 0, "percent": 0},
+        "images": [{"index": i, "filename": it[0], "isDiagram": it[2], "isThumbnail": it[3], "status": "pending"}
+                   for i, it in enumerate(items)],
+        "result": None,
+        "_updated": time.time(),
+    }
+    _upload_progress[upload_id] = job
+    queue: asyncio.Queue = asyncio.Queue()
+    job["_task"] = asyncio.create_task(_run_manual_upload(job, queue, items, brand, mpn, email))
+
+    async def event_stream():
+        while True:
+            event = await queue.get()
+            yield json.dumps(event, ensure_ascii=False, default=str) + "\n"
+            if event["event"] == "done":
+                break
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Upload-Id": upload_id},
+    )
+
+
+@router.get("/upload-progress/{upload_id}", summary="Consultar el progreso de una subida hecha con /upload-product-image/stream")
+def get_upload_progress(upload_id: str):
+    """
+    Estado actual de la subida: `status` (running | done | error), `progress`
+    ({total, processed, uploaded, failed, percent}), `images[]` con el paso de cada una
+    (pending | optimizing | uploading | bigcommerce | done | failed) y, al terminar, `result`
+    con el mismo resumen del endpoint normal. Se guarda 1 hora después de terminar.
+    """
+    job = _upload_progress.get(upload_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"No hay una subida con upload_id={upload_id} (o ya expiró)")
+    return _public_job(job)
 
 
 WAREHOUSE_MAX_PHOTO_BYTES = 15 * 1024 * 1024
@@ -1074,6 +1311,70 @@ def list_processed_candidates(
         result = get_processed_candidates(page=page, limit=limit, brand=brand, mpn=mpn, lote=lote, email=email, date_from=date_from, date_to=date_to)
         result["globalStats"] = get_global_stats()
         return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _utc_iso_to_local(value: Optional[str]) -> Optional[str]:
+    """processedAt (UTC, ISO) → hora local del servidor (UTC-5), igual que los filtros de fecha."""
+    if not value:
+        return value
+    offset = datetime.now() - datetime.utcnow()
+    offset_min = round(offset.total_seconds() / 60)
+    from datetime import timedelta
+    return (datetime.fromisoformat(value) + timedelta(minutes=offset_min)).isoformat(timespec="seconds")
+
+
+@router.get("/manual-uploads", summary="Listar imágenes subidas manualmente (con su resultado en BigCommerce)")
+def list_manual_uploads(
+    page: int = Query(1, ge=1, description="Número de página"),
+    limit: int = Query(20, ge=1, le=100, description="Límite de resultados por página"),
+    brand: Optional[str] = Query(None, description="Filtrar por marca"),
+    mpn: Optional[str] = Query(None, description="Filtrar por MPN"),
+    email: Optional[str] = Query(None, description="Filtrar por usuario que subió la imagen"),
+    date_from: Optional[str] = Query(None, description="Fecha inicio en hora local (ej. 2026-11-01)"),
+    date_to: Optional[str] = Query(None, description="Fecha fin en hora local; solo fecha = incluye todo ese día (ej. 2026-11-30)"),
+):
+    """
+    Lista las imágenes subidas manualmente (POST /candidates/upload-product-image y su versión
+    /stream), de la más reciente a la más antigua.
+
+    Cada imagen trae `bigcommerce`:
+    - `status`: `ok` (en todas sus tiendas) | `partial` (en algunas) | `failed` (en ninguna)
+      | `pending` (todavía sin resultado: el envío sigue en curso)
+    - `storesOk`, `storesFailed`, `isThumbnail` (si se subió como principal) y `sentAt` (hora local)
+    """
+    try:
+        result = get_processed_candidates(page=page, limit=limit, brand=brand, mpn=mpn, email=email,
+                                          date_from=date_from, date_to=date_to, processed_method="manual_upload")
+        approvals = get_candidate_approval_results([doc.get("_id") for doc in result["results"]])
+        items = []
+        for doc in result["results"]:
+            row = approvals.get(doc.get("_id"))
+            if row:
+                bc = {
+                    "status": bigcommerce_status(row["bc_stores_ok"] or 0, row["bc_stores_failed"] or 0),
+                    "storesOk": row["bc_stores_ok"],
+                    "storesFailed": row["bc_stores_failed"],
+                    "isThumbnail": None if row["is_thumbnail"] is None else bool(row["is_thumbnail"]),
+                    "sentAt": row["approved_at"].isoformat() if row["approved_at"] else None,
+                }
+            else:
+                bc = {"status": "pending", "storesOk": None, "storesFailed": None, "isThumbnail": None, "sentAt": None}
+            items.append({
+                "candidateId": doc.get("_id"),
+                "brand": doc.get("brand"),
+                "mpn": doc.get("mpn"),
+                "imageUrl": doc.get("imageUrl"),
+                "email": doc.get("email"),
+                "isDiagram": bool(doc.get("isDiagram")),
+                "isPrimaryManual": doc.get("isPrimaryManual"),
+                "uploadedAt": _utc_iso_to_local(doc.get("processedAt")),
+                "bigcommerce": bc,
+            })
+        return {"results": items, "stats": result["stats"]}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

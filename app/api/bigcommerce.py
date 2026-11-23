@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field, validator
 from typing import Optional
 from app.services.bigcommerce_service import process_bigcommerce_image_update
+from app.services.review_approvals_sync import save_candidate_approvals, BIGCOMMERCE_UPLOAD_SOURCE
 import logging
 
 router = APIRouter(prefix="/bigcommerce", tags=["BigCommerce"])
@@ -23,7 +24,8 @@ class BigCommerceImageUploadRequest(BaseModel):
     original_image_url: str = Field(..., description="URL de la imagen original")
     is_diagram: bool = Field(False, description="True si la imagen es un diagrama (__IMG = DGR); False = foto (__IMG = NWM)")
     is_thumbnail: bool = Field(True, description="True = imagen PRINCIPAL del producto en BigCommerce (is_thumbnail); False = imagen secundaria de la galería")
-    
+    email: Optional[str] = Field(None, description="Opcional: quién sube la imagen; queda en el reporte de imágenes aprobadas")
+
     @validator('brand')
     def brand_not_empty(cls, v):
         if not v or v.strip() == "":
@@ -60,9 +62,18 @@ class BigCommerceUploadResponse(BaseModel):
 
 # ==================== FUNCIONES DE BACKGROUND ====================
 
-async def process_bigcommerce_upload(brand: str, sku: str, processed_image_url: str, original_image_url: str, task_id: str, is_diagram: bool = False, is_thumbnail: bool = True):
+def bigcommerce_status(stores_ok: int, stores_failed: int) -> str:
+    """ok = subió a todas sus tiendas; partial = a algunas; failed = a ninguna (o producto no encontrado)."""
+    if stores_ok and not stores_failed:
+        return "ok"
+    if stores_ok:
+        return "partial"
+    return "failed"
+
+
+def run_bigcommerce_upload(brand: str, sku: str, processed_image_url: str, task_id: str, is_diagram: bool = False, is_thumbnail: bool = True, approval: Optional[dict] = None) -> dict:
     """
-    Procesa el upload de imagen a BigCommerce en segundo plano.
+    Sube una imagen a BigCommerce (bloqueante) y devuelve el resultado por tienda.
 
     Flujo:
       1. Buscar producto en MongoDB (brand + SKU/MPN)
@@ -70,7 +81,10 @@ async def process_bigcommerce_upload(brand: str, sku: str, processed_image_url: 
       3. Eliminar imágenes actuales del producto (logos/default)
       4. Subir la imagen procesada nueva
       5. Marcar custom field __IMG = "DGR" si es_diagram, o "NWM" si no
+      6. Si viene `approval` (dict con source, email, candidate_id, lote...), guardar la imagen
+         como aprobada en MySQL (image_candidate_approvals) con el resultado por tienda
     """
+    stores_ok, stores_failed, errors = 0, 0, []
     try:
         logger.info(f"[{task_id}] Tarea recibida: brand={brand}, sku={sku}, is_diagram={is_diagram}, is_thumbnail={is_thumbnail}")
         result = process_bigcommerce_image_update(
@@ -81,6 +95,9 @@ async def process_bigcommerce_upload(brand: str, sku: str, processed_image_url: 
             is_diagram=is_diagram,
             is_thumbnail=is_thumbnail,
         )
+        stores_ok = sum(1 for s in result["stores_processed"] if s.get("uploaded_image_id"))
+        stores_failed = len(result["stores_processed"]) - stores_ok
+        errors = [str(e) for e in result.get("errors") or []]
         logger.info(
             f"[{task_id}] Tarea completada: "
             f"productos={result['products_found']}, "
@@ -88,7 +105,31 @@ async def process_bigcommerce_upload(brand: str, sku: str, processed_image_url: 
             f"errores={len(result['errors'])}"
         )
     except Exception as e:
-        logger.error(f"[{task_id}] Error inesperado en background task: {e}", exc_info=True)
+        logger.error(f"[{task_id}] Error inesperado subiendo a BigCommerce: {e}", exc_info=True)
+        errors.append(str(e))
+
+    if approval is not None:
+        # Se guarda aunque BigCommerce haya fallado (bc_stores_ok = 0) para que se vea en el reporte
+        save_candidate_approvals([{
+            "chunk_id": task_id, "brand": brand, "mpn": sku, "image_url": processed_image_url,
+            "is_diagram": int(bool(is_diagram)), "is_thumbnail": int(bool(is_thumbnail)),
+            "bc_stores_ok": stores_ok, "bc_stores_failed": stores_failed,
+            **approval,
+        }])
+
+    return {
+        "taskId": task_id,
+        "status": bigcommerce_status(stores_ok, stores_failed),
+        "storesOk": stores_ok,
+        "storesFailed": stores_failed,
+        "errors": errors[:5],
+    }
+
+
+def process_bigcommerce_upload(brand: str, sku: str, processed_image_url: str, original_image_url: str, task_id: str, is_diagram: bool = False, is_thumbnail: bool = True, approval: Optional[dict] = None):
+    """Tarea en background (sync: Starlette la corre en un hilo y no bloquea el event loop)."""
+    run_bigcommerce_upload(brand, sku, processed_image_url, task_id, is_diagram=is_diagram,
+                           is_thumbnail=is_thumbnail, approval=approval)
 
 
 # ==================== ENDPOINTS ====================
@@ -151,8 +192,9 @@ async def upload_image_to_bigcommerce(
         task_id=task_id,
         is_diagram=request.is_diagram,
         is_thumbnail=request.is_thumbnail,
+        approval={"source": BIGCOMMERCE_UPLOAD_SOURCE, "email": request.email},
     )
-    
+
     logger.info(f"✓ Tarea iniciada: {task_id} ({request.brand}/{request.sku})")
     
     return BigCommerceUploadResponse(
