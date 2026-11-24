@@ -246,6 +246,64 @@ def get_store_credentials(store_id: int) -> Dict:
             connection.close()
 
 
+# ==================== URL PÚBLICA DEL PRODUCTO ====================
+
+# Tienda cuya URL se devuelve como "la URL del producto" (la 5 tiene todo el catálogo)
+PRODUCT_URL_STORE_ID = int(os.getenv("PRODUCT_URL_STORE_ID", "5"))
+_store_base_url_cache: Dict[str, Optional[str]] = {}
+
+
+def get_store_base_url(store_id) -> Optional[str]:
+    """Dominio público de la tienda (prontoweb.stores.URLSTORE), cacheado en memoria."""
+    key = str(store_id)
+    if key in _store_base_url_cache:
+        return _store_base_url_cache[key]
+    connection = None
+    try:
+        connection = mysql.connector.connect(
+            host=os.getenv("MYSQL_HOST"),
+            user=os.getenv("MYSQL_USER"),
+            password=os.getenv("MYSQL_PASSWORD"),
+            database=os.getenv("MYSQL_DATABASE", "prontoweb"),
+            connection_timeout=5,
+        )
+        cursor = connection.cursor()
+        cursor.execute("SELECT URLSTORE FROM stores WHERE id = %s", (store_id,))
+        row = cursor.fetchone()
+        base = (row[0] or "").strip().rstrip("/") if row else ""
+        _store_base_url_cache[key] = base or None
+    except Exception as e:
+        logger.error(f"No se pudo leer URLSTORE de store_id={store_id}: {e}")
+        return None
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+    return _store_base_url_cache[key]
+
+
+def build_product_url(products: List[Dict], preferred_store_id: int = PRODUCT_URL_STORE_ID) -> Optional[str]:
+    """
+    URL pública del producto: dominio de la tienda + CUSTOM_URL.url del producto en Mongo.
+    Usa la tienda `preferred_store_id` (5); si el producto no está ahí, la primera otra tienda que la tenga.
+    """
+    ordered = sorted(products or [], key=lambda p: str(p.get("STOREID")) != str(preferred_store_id))
+    for product in ordered:
+        path = ((product.get("CUSTOM_URL") or {}).get("url") or "").strip()
+        base = get_store_base_url(product.get("STOREID")) if path else None
+        if base:
+            return f"{base}/{path.lstrip('/')}"
+    return None
+
+
+def get_product_url(brand: str, sku: str) -> Optional[str]:
+    """URL pública del producto (ver build_product_url). None si no existe o no tiene URL."""
+    try:
+        return build_product_url(search_products_by_brand_and_sku(brand, sku))
+    except Exception as e:
+        logger.error(f"No se pudo armar la URL del producto {brand}/{sku}: {e}")
+        return None
+
+
 # ==================== BIGCOMMERCE API ====================
 
 def _bc_headers(access_token: str, client_id: str = "") -> Dict:
@@ -529,6 +587,7 @@ def process_bigcommerce_image_update(
         "brand": brand,
         "sku": sku,
         "products_found": 0,
+        "product_url": None,
         "stores_processed": [],
         "errors": [],
     }
@@ -544,6 +603,7 @@ def process_bigcommerce_image_update(
         return summary
 
     summary["products_found"] = len(products)
+    summary["product_url"] = build_product_url(products)
 
     # 2. Procesar cada producto (puede estar en varias tiendas); las tiendas son independientes
     # entre sí, así que se procesan en paralelo

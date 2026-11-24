@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS `{CANDIDATE_APPROVALS_TABLE}` (
   `bc_stores_failed` int(11) NOT NULL DEFAULT 0,
   `is_diagram` tinyint(1) DEFAULT NULL,
   `is_thumbnail` tinyint(1) DEFAULT NULL,
+  `product_url` varchar(500) DEFAULT NULL,
   `approved_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   KEY `idx_approved_at` (`approved_at`),
@@ -112,7 +113,8 @@ SELECT
   NULL AS `es_diagrama`,
   NULL AS `es_principal`,
   NULL AS `bc_tiendas_ok`,
-  NULL AS `bc_tiendas_error`
+  NULL AS `bc_tiendas_error`,
+  NULL AS `url_producto`
 FROM `{TABLE_NAME}` r
 WHERE r.`deleted_at` IS NULL
 UNION ALL
@@ -137,7 +139,8 @@ SELECT
   a.`is_diagram`,
   a.`is_thumbnail`,
   a.`bc_stores_ok`,
-  a.`bc_stores_failed`
+  a.`bc_stores_failed`,
+  a.`product_url`
 FROM `{CANDIDATE_APPROVALS_TABLE}` a
 """
 
@@ -224,9 +227,14 @@ def _ensure_table(cursor):
             (CANDIDATE_APPROVALS_TABLE,),
         )
         existing = {row[0] for row in cursor.fetchall()}
-        for col in ("is_diagram", "is_thumbnail"):
+        added_columns = (
+            ("is_diagram", "tinyint(1) DEFAULT NULL AFTER `bc_stores_failed`"),
+            ("is_thumbnail", "tinyint(1) DEFAULT NULL AFTER `is_diagram`"),
+            ("product_url", "varchar(500) DEFAULT NULL AFTER `is_thumbnail`"),
+        )
+        for col, definition in added_columns:
             if col not in existing:
-                cursor.execute(f"ALTER TABLE `{CANDIDATE_APPROVALS_TABLE}` ADD COLUMN `{col}` tinyint(1) DEFAULT NULL AFTER `bc_stores_failed`")
+                cursor.execute(f"ALTER TABLE `{CANDIDATE_APPROVALS_TABLE}` ADD COLUMN `{col}` {definition}")
         cursor.execute(REVIEWS_VIEW_SQL)
         _table_ready = True
 
@@ -241,7 +249,7 @@ def save_candidate_approvals(rows: list) -> bool:
     if not rows:
         return True
     columns = ["chunk_id", "candidate_id", "brand", "mpn", "image_url", "source", "lote",
-               "email", "bc_stores_ok", "bc_stores_failed", "is_diagram", "is_thumbnail"]
+               "email", "bc_stores_ok", "bc_stores_failed", "is_diagram", "is_thumbnail", "product_url"]
     connection = None
     try:
         connection = _get_connection()
@@ -278,9 +286,10 @@ def get_candidate_approval_results(candidate_ids: list) -> dict:
     connection = None
     try:
         connection = _get_connection()
+        _ensure_table(connection.cursor())  # agrega product_url si la tabla aún no la tiene
         cursor = connection.cursor(dictionary=True)
         cursor.execute(
-            f"SELECT candidate_id, bc_stores_ok, bc_stores_failed, is_thumbnail, approved_at, source "
+            f"SELECT candidate_id, bc_stores_ok, bc_stores_failed, is_thumbnail, approved_at, source, product_url "
             f"FROM `{CANDIDATE_APPROVALS_TABLE}` WHERE candidate_id IN ({', '.join(['%s'] * len(ids))}) "
             f"ORDER BY id",
             ids,

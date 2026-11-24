@@ -6,7 +6,7 @@ Incluye endpoints para upload de imágenes.
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field, validator
 from typing import Optional
-from app.services.bigcommerce_service import process_bigcommerce_image_update
+from app.services.bigcommerce_service import process_bigcommerce_image_update, get_product_url
 from app.services.review_approvals_sync import save_candidate_approvals, BIGCOMMERCE_UPLOAD_SOURCE
 import logging
 
@@ -58,6 +58,7 @@ class BigCommerceUploadResponse(BaseModel):
     brand: str
     sku: str
     status: str
+    productUrl: Optional[str] = None
 
 
 # ==================== FUNCIONES DE BACKGROUND ====================
@@ -84,7 +85,7 @@ def run_bigcommerce_upload(brand: str, sku: str, processed_image_url: str, task_
       6. Si viene `approval` (dict con source, email, candidate_id, lote...), guardar la imagen
          como aprobada en MySQL (image_candidate_approvals) con el resultado por tienda
     """
-    stores_ok, stores_failed, errors = 0, 0, []
+    stores_ok, stores_failed, errors, product_url = 0, 0, [], None
     try:
         logger.info(f"[{task_id}] Tarea recibida: brand={brand}, sku={sku}, is_diagram={is_diagram}, is_thumbnail={is_thumbnail}")
         result = process_bigcommerce_image_update(
@@ -98,6 +99,7 @@ def run_bigcommerce_upload(brand: str, sku: str, processed_image_url: str, task_
         stores_ok = sum(1 for s in result["stores_processed"] if s.get("uploaded_image_id"))
         stores_failed = len(result["stores_processed"]) - stores_ok
         errors = [str(e) for e in result.get("errors") or []]
+        product_url = result.get("product_url")
         logger.info(
             f"[{task_id}] Tarea completada: "
             f"productos={result['products_found']}, "
@@ -113,7 +115,7 @@ def run_bigcommerce_upload(brand: str, sku: str, processed_image_url: str, task_
         save_candidate_approvals([{
             "chunk_id": task_id, "brand": brand, "mpn": sku, "image_url": processed_image_url,
             "is_diagram": int(bool(is_diagram)), "is_thumbnail": int(bool(is_thumbnail)),
-            "bc_stores_ok": stores_ok, "bc_stores_failed": stores_failed,
+            "bc_stores_ok": stores_ok, "bc_stores_failed": stores_failed, "product_url": product_url,
             **approval,
         }])
 
@@ -122,6 +124,7 @@ def run_bigcommerce_upload(brand: str, sku: str, processed_image_url: str, task_
         "status": bigcommerce_status(stores_ok, stores_failed),
         "storesOk": stores_ok,
         "storesFailed": stores_failed,
+        "productUrl": product_url,
         "errors": errors[:5],
     }
 
@@ -202,5 +205,6 @@ async def upload_image_to_bigcommerce(
         taskId=task_id,
         brand=request.brand,
         sku=request.sku,
-        status="queued"
+        status="queued",
+        productUrl=get_product_url(request.brand, request.sku),
     )

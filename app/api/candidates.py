@@ -37,7 +37,7 @@ import logging
 logger = logging.getLogger(__name__)
 from app.services.mysql_stats_service import save_stats_snapshot
 from app.services.review_approvals_sync import sync_review_approvals, save_candidate_approvals, get_candidate_approval_results, MANUAL_UPLOAD_SOURCE
-from app.services.bigcommerce_service import search_products_by_brand_and_sku, process_bigcommerce_image_update
+from app.services.bigcommerce_service import search_products_by_brand_and_sku, process_bigcommerce_image_update, build_product_url, get_product_url
 from app.api.bigcommerce import process_bigcommerce_upload, run_bigcommerce_upload, bigcommerce_status
 from app.config import WAREHOUSE_API_KEY
 
@@ -399,9 +399,11 @@ def approve_images(
             continue
         thumb_by_url = dict(zip(result.imageUrls, thumbs)) if thumbs is not None else {}
 
-        if not search_products_by_brand_and_sku(brand, mpn):
+        products = search_products_by_brand_and_sku(brand, mpn)
+        product_url = build_product_url(products)
+        if not products:
             results_out.append({
-                "brand": brand, "mpn": mpn, "ok": False,
+                "brand": brand, "mpn": mpn, "ok": False, "productUrl": None,
                 "error": f"No existe un producto con brand={brand} y mpn/sku={mpn} en el catálogo",
                 "images": [{"imageUrl": url, "ok": False, "error": "Producto no existe"} for url in result.imageUrls],
             })
@@ -477,6 +479,7 @@ def approve_images(
                 "image_url": url, "source": source_doc.get("source"), "lote": source_doc.get("lote"),
                 "email": email, "bc_stores_ok": stores_ok, "bc_stores_failed": stores_failed,
                 "is_diagram": int(bool(source_doc.get("isDiagram"))), "is_thumbnail": int(bool(thumb_by_url.get(url, True))),
+                "product_url": product_url,
             })
             images_out.append({
                 "imageUrl": url, "ok": True, "candidateId": candidate_id, "movedCandidateIds": moved_ids,
@@ -484,7 +487,7 @@ def approve_images(
                                 "isThumbnail": thumb_by_url.get(url, True)},
             })
 
-        results_out.append({"brand": brand, "mpn": mpn,
+        results_out.append({"brand": brand, "mpn": mpn, "productUrl": product_url,
                             "ok": bool(images_out) and all(i["ok"] for i in images_out), "images": images_out})
 
     if approvals:
@@ -648,6 +651,7 @@ async def upload_product_image_endpoint(
         "brand": brand,
         "mpn": mpn,
         "email": email,
+        "productUrl": get_product_url(brand, mpn),
         "totalUploaded": len(created),
         "totalFailed": len(failed),
         "candidates": created,
@@ -700,7 +704,7 @@ async def _run_manual_upload(job: dict, queue: asyncio.Queue, items: list, brand
 
     created, failed = [], []
     try:
-        emit("start", brand=brand, mpn=mpn, email=email, images=[{"index": i["index"], "filename": i["filename"]} for i in job["images"]])
+        emit("start", brand=brand, mpn=mpn, email=email, productUrl=job["productUrl"], images=[{"index": i["index"], "filename": i["filename"]} for i in job["images"]])
 
         async def send_to_bigcommerce(prev_task, idx, filename, image_url, candidate, diagram_flag, thumbnail_flag, timestamp):
             # Los envíos a BigCommerce del mismo producto van en orden, uno tras otro (el primero
@@ -779,7 +783,7 @@ async def _run_manual_upload(job: dict, queue: asyncio.Queue, items: list, brand
                 logger.error(f"[{job['uploadId']}] Error guardando snapshot de estadísticas: {e}")
 
         job["result"] = {
-            "brand": brand, "mpn": mpn, "email": email,
+            "brand": brand, "mpn": mpn, "email": email, "productUrl": job["productUrl"],
             "totalUploaded": len(created), "totalFailed": len(failed),
             "candidates": created, "failed": failed, "resolvedNotFound": resolved_not_found,
         }
@@ -788,7 +792,8 @@ async def _run_manual_upload(job: dict, queue: asyncio.Queue, items: list, brand
         logger.error(f"[{job['uploadId']}] Error inesperado en la subida: {e}", exc_info=True)
         job["status"] = "error"
         job["error"] = str(e)
-        job["result"] = {"brand": brand, "mpn": mpn, "email": email, "totalUploaded": len(created),
+        job["result"] = {"brand": brand, "mpn": mpn, "email": email, "productUrl": job["productUrl"],
+                         "totalUploaded": len(created),
                          "totalFailed": total - len(created), "candidates": created, "failed": failed,
                          "resolvedNotFound": []}
     progress["percent"] = 100
@@ -841,6 +846,7 @@ async def upload_product_image_stream(
     job = {
         "uploadId": upload_id,
         "brand": brand, "mpn": mpn, "email": email,
+        "productUrl": await run_in_threadpool(get_product_url, brand, mpn),
         "status": "running",
         "startedAt": datetime.utcnow().isoformat(),
         "progress": {"total": len(items), "processed": 0, "uploaded": 0, "failed": 0, "percent": 0},
@@ -1348,9 +1354,16 @@ def list_manual_uploads(
         result = get_processed_candidates(page=page, limit=limit, brand=brand, mpn=mpn, email=email,
                                           date_from=date_from, date_to=date_to, processed_method="manual_upload")
         approvals = get_candidate_approval_results([doc.get("_id") for doc in result["results"]])
+        url_cache = {}
         items = []
         for doc in result["results"]:
             row = approvals.get(doc.get("_id"))
+            key = (doc.get("brand"), doc.get("mpn"))
+            if row and row.get("product_url"):
+                url_cache.setdefault(key, row["product_url"])
+            if key not in url_cache:
+                # Subidas anteriores a la columna product_url: se arma desde el catálogo
+                url_cache[key] = get_product_url(*key)
             if row:
                 bc = {
                     "status": bigcommerce_status(row["bc_stores_ok"] or 0, row["bc_stores_failed"] or 0),
@@ -1366,6 +1379,7 @@ def list_manual_uploads(
                 "brand": doc.get("brand"),
                 "mpn": doc.get("mpn"),
                 "imageUrl": doc.get("imageUrl"),
+                "productUrl": url_cache[key],
                 "email": doc.get("email"),
                 "isDiagram": bool(doc.get("isDiagram")),
                 "isPrimaryManual": doc.get("isPrimaryManual"),
