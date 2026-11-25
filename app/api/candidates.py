@@ -1134,7 +1134,8 @@ def global_stats():
     - **pending**: candidatos aún sin procesar (tabla `image_candidates`)
     - **processed**: candidatos ya procesados/aprobados (`processed_candidates`), bot + manual
     - **deleted**: candidatos eliminados con borrado lógico (`deleted_candidates`)
-    - **notFound**: búsquedas sin resultado (`image_candidates_not_found`)
+    - **notFound**: no encontradas por el script de automatización: búsquedas sin resultado (`image_candidates_not_found`)
+    - **notFoundByUser**: no encontradas por el usuario: SKUs marcados con `POST /candidates/mark-no-image` (`reviewed_no_image`)
     - **failedImages**: total de registros de imágenes fallidas (`failed_images`)
     - **failedCandidates**: candidatos únicos con al menos una imagen fallida
     - **total**: pending + processed + deleted

@@ -30,6 +30,7 @@ STATS_COLUMNS = {
     "processed":               "processed",
     "deleted":                 "deleted",
     "notFound":                "not_found",
+    "notFoundByUser":          "not_found_by_user",
     "failedImages":            "failed_images",
     "failedCandidates":        "failed_candidates",
     "total":                   "total",

@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api import image
 from app.api import candidates
 from app.api import bigcommerce
+from app.api import brands
 from app.services.review_approvals_sync import start_review_sync_loop
 from app.security import require_api_key
 
@@ -28,6 +29,7 @@ protected = [Depends(require_api_key)]
 app.include_router(image.router, prefix="/image", tags=["image"], dependencies=protected)
 app.include_router(candidates.router, prefix="/candidates", tags=["candidates"], dependencies=protected)
 app.include_router(bigcommerce.router, dependencies=protected)
+app.include_router(brands.router, prefix="/brands", tags=["brands"], dependencies=protected)
 
 
 @app.on_event("startup")

@@ -659,7 +659,8 @@ def get_global_stats():
     - pending:            candidatos aún en la tabla original (por procesar)
     - processed:          candidatos trasladados a processed_candidates (aprobados, bot + manual)
     - deleted:            candidatos eliminados (borrado lógico)
-    - notFound:           búsquedas sin resultado (image_candidates_not_found)
+    - notFound:           no encontradas por el script de automatización (image_candidates_not_found)
+    - notFoundByUser:     no encontradas por el usuario: SKUs marcados sin imagen (reviewed_no_image)
     - failedImages:       total de registros en failed_images
     - failedCandidates:   candidatos únicos con al menos una imagen fallida
     - total:              suma de pending + processed + deleted
@@ -699,7 +700,10 @@ def get_global_stats():
     pending            = collection.count_documents({})
     processed          = processed_candidates_collection.count_documents(not_resolved)
     deleted            = deleted_candidates_collection.count_documents({})
+    # No encontradas por el script de automatización (búsquedas sin resultado)
     not_found          = not_found_candidates_collection.count_documents({})
+    # No encontradas por el usuario: SKUs que él marcó como revisados sin imagen (POST /mark-no-image)
+    not_found_by_user  = reviewed_no_image_collection.count_documents({})
     failed_images      = failed_images_collection.count_documents({})
     # Candidatos únicos con al menos una imagen fallida (por brand+mpn)
     failed_candidates  = len(failed_images_collection.distinct("mpn"))
@@ -737,6 +741,7 @@ def get_global_stats():
         "processed":        processed,
         "deleted":          deleted,
         "notFound":         not_found,
+        "notFoundByUser":   not_found_by_user,
         "failedImages":     failed_images,
         "failedCandidates": failed_candidates,
         "total":            pending + processed + deleted,
